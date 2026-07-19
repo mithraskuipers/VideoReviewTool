@@ -1,0 +1,636 @@
+"""
+VideoReviewTool
+------------------
+A local web app for quickly triaging a folder of videos: shows a rotating
+set of 20 evenly-spaced thumbnails per video and lets you Delete / Keep /
+Sort with single key presses.
+
+Run with: python app.py   (or use start.bat / start.sh)
+Then open: http://127.0.0.1:5000
+"""
+
+import os
+import time
+import json
+import uuid
+import shutil
+import hashlib
+import threading
+import webbrowser
+import concurrent.futures
+from pathlib import Path
+
+# Must be set before `import cv2` to take effect. Some videos (variable frame
+# rate, odd container/codec combos, lots of audio packets between video
+# packets) make ffmpeg's demuxer need far more read attempts than OpenCV's
+# default (4096) to find the next video packet after a seek, which otherwise
+# surfaces as "packet read max attempts exceeded" and a failed grab.
+#
+# IMPORTANT: use direct assignment, not setdefault(). If this variable is
+# already set in the shell/system environment (e.g. someone tried the value
+# the warning message itself suggests setting), setdefault() would silently
+# do nothing and the override would never actually take effect.
+os.environ["OPENCV_FFMPEG_READ_ATTEMPTS"] = "1000000"
+os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
+os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"
+os.environ["OPENCV_VIDEOIO_DEBUG"] = "0"
+
+from flask import Flask, request, jsonify, send_file, render_template
+import cv2
+import numpy as np
+from send2trash import send2trash
+
+# Belt-and-suspenders log silencing — different cv2 builds expose this
+# differently, so try every form rather than relying on just one.
+# Belt-and-suspenders log silencing — different cv2 builds expose this
+# differently, so try every form rather than relying on just one.
+try:
+    cv2.setLogLevel(cv2.LOG_LEVEL_SILENT)
+except Exception:
+    try:
+        cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_SILENT)
+    except Exception:
+        pass  # older/newer cv2 builds may not expose either; env vars above still apply
+
+app = Flask(__name__)
+
+VIDEO_EXTENSIONS = {
+    ".mp4", ".avi", ".mov", ".mkv", ".webm",
+    ".flv", ".wmv", ".m4v", ".mpg", ".mpeg", ".ts",
+}
+DEFAULT_NUM_SNAPSHOTS = 20
+MIN_NUM_SNAPSHOTS = 2
+MAX_NUM_SNAPSHOTS = 100
+
+DEFAULT_SLIDESHOW_MS = 225  # 2x faster than the original 450ms default
+MIN_SLIDESHOW_MS = 50
+MAX_SLIDESHOW_MS = 3000
+
+CACHE_DIR = Path.home() / ".video_review_tool_cache"
+CACHE_DIR.mkdir(exist_ok=True)
+
+# --------------------------------------------------------------------------
+# Hard per-frame timeout.
+#
+# cv2/ffmpeg calls on a broken file don't just fail slowly, they can hang
+# outright with no exception ever raised. Nothing in Python can forcibly
+# kill a stuck native call, so instead we run each grab in a worker thread
+# and simply stop *waiting* on it after FRAME_TIMEOUT_SECONDS. The stray
+# thread may keep running in the background and dies on its own once the
+# native call eventually returns (or the process exits), but the request
+# that asked for it is never blocked longer than the timeout, and the pool
+# below caps how many stuck workers can pile up at once.
+# --------------------------------------------------------------------------
+FRAME_TIMEOUT_SECONDS = 6
+_frame_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="frame-grab")
+
+
+def run_with_timeout(fn, timeout=FRAME_TIMEOUT_SECONDS):
+    future = _frame_executor.submit(fn)
+    try:
+        return future.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        return None
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------
+# Per-video decode lock.
+#
+# The browser requests all N thumbnails for a video in parallel (~6 at once).
+# With the server now threaded, that means several threads could call
+# cv2.VideoCapture() on the *same file* at the same time. OpenCV's ffmpeg
+# backend is not safe for that: concurrent decodes of one file corrupt each
+# other's frame state, which is exactly what "sps_id out of range" /
+# "missing picture in access unit" / "error while decoding MB" are — and it
+# gets worse (hangs, garbage frames) the more requests pile up at once.
+# A lock per file path keeps decoding of any single video serialized, while
+# still letting unrelated requests (status, actions, other videos) run
+# freely on other threads.
+# --------------------------------------------------------------------------
+_video_locks_guard = threading.Lock()
+_video_locks = {}
+
+
+def _get_video_lock(path):
+    with _video_locks_guard:
+        lock = _video_locks.get(path)
+        if lock is None:
+            lock = threading.Lock()
+            _video_locks[path] = lock
+        return lock
+
+SETTINGS_FILE = Path.home() / ".video_review_tool_settings.json"
+
+DEFAULT_SETTINGS = {
+    "delete_key": "d",
+    "keep_key": "k",
+    "default_num_snapshots": DEFAULT_NUM_SNAPSHOTS,
+    "slideshow_interval_ms": DEFAULT_SLIDESHOW_MS,
+    "sort_buttons": [
+        {"id": "sort_1", "key": "1", "folder": "1"},
+        {"id": "sort_2", "key": "2", "folder": "2"},
+        {"id": "sort_3", "key": "3", "folder": "3"},
+    ],
+}
+
+
+def sanitize_key(value, fallback):
+    value = str(value or "").strip().lower()
+    return value[0] if value else fallback
+
+
+def sanitize_folder_name(name):
+    name = str(name or "").strip()
+    for bad in ("/", "\\", ".."):
+        name = name.replace(bad, "")
+    return name[:60].strip()
+
+
+def normalize_settings(data):
+    data = data or {}
+    settings = {
+        "delete_key": sanitize_key(data.get("delete_key"), "d"),
+        "keep_key": sanitize_key(data.get("keep_key"), "k"),
+        "default_num_snapshots": DEFAULT_NUM_SNAPSHOTS,
+        "slideshow_interval_ms": DEFAULT_SLIDESHOW_MS,
+        "sort_buttons": [],
+    }
+
+    try:
+        n = int(data.get("default_num_snapshots", DEFAULT_NUM_SNAPSHOTS))
+        settings["default_num_snapshots"] = max(MIN_NUM_SNAPSHOTS, min(MAX_NUM_SNAPSHOTS, n))
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        ms = int(data.get("slideshow_interval_ms", DEFAULT_SLIDESHOW_MS))
+        settings["slideshow_interval_ms"] = max(MIN_SLIDESHOW_MS, min(MAX_SLIDESHOW_MS, ms))
+    except (TypeError, ValueError):
+        pass
+
+    for b in data.get("sort_buttons", []):
+        key = sanitize_key(b.get("key"), "")
+        folder = sanitize_folder_name(b.get("folder"))
+        if not key or not folder:
+            continue
+        bid = b.get("id") or f"sort_{uuid.uuid4().hex[:8]}"
+        settings["sort_buttons"].append({"id": bid, "key": key, "folder": folder})
+
+    return settings
+
+
+def settings_are_valid(settings):
+    keys = [settings["delete_key"], settings["keep_key"]] + [b["key"] for b in settings["sort_buttons"]]
+    if any(not k or not k.isalnum() for k in keys):
+        return False, "Every button needs a single letter or number as its key."
+    if len(keys) != len(set(keys)):
+        return False, "Each key can only be assigned to one button."
+    return True, None
+
+
+def load_settings():
+    if SETTINGS_FILE.exists():
+        try:
+            return normalize_settings(json.loads(SETTINGS_FILE.read_text()))
+        except Exception:
+            pass
+    return normalize_settings(DEFAULT_SETTINGS)
+
+
+def persist_settings(settings):
+    try:
+        SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
+    except Exception:
+        pass  # keep working in-memory even if the disk write fails
+
+
+state_lock = threading.Lock()
+state = {
+    "folder": None,
+    "videos": [],       # list of dicts: id, filename, path, size, status, destination
+    "current_index": 0,
+    "num_snapshots": DEFAULT_NUM_SNAPSHOTS,
+    "settings": load_settings(),
+}
+state["num_snapshots"] = state["settings"]["default_num_snapshots"]
+
+
+def make_id(path: str) -> str:
+    return hashlib.sha1(path.encode("utf-8")).hexdigest()[:16]
+
+
+def find_video(vid: str):
+    for v in state["videos"]:
+        if v["id"] == vid:
+            return v
+    return None
+
+
+# --------------------------------------------------------------------------
+# Pages
+# --------------------------------------------------------------------------
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+# --------------------------------------------------------------------------
+# API
+# --------------------------------------------------------------------------
+
+@app.route("/api/browse", methods=["POST"])
+def browse():
+    """Open a native folder picker on the machine running the server."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        folder = filedialog.askdirectory(title="Select folder with videos")
+        root.destroy()
+
+        if not folder:
+            return jsonify({"success": False, "error": "No folder selected"})
+        return jsonify({"success": True, "path": folder})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route("/api/settings", methods=["GET"])
+def get_settings():
+    with state_lock:
+        return jsonify({"success": True, "settings": state["settings"]})
+
+
+@app.route("/api/settings", methods=["POST"])
+def save_settings():
+    data = request.get_json(force=True)
+    normalized = normalize_settings(data.get("settings"))
+
+    valid, error = settings_are_valid(normalized)
+    if not valid:
+        return jsonify({"success": False, "error": error})
+
+    with state_lock:
+        # keep whichever snapshot count / speed is currently in use unless explicitly provided
+        normalized["default_num_snapshots"] = data.get("settings", {}).get(
+            "default_num_snapshots", state["settings"]["default_num_snapshots"]
+        )
+        normalized["slideshow_interval_ms"] = data.get("settings", {}).get(
+            "slideshow_interval_ms", state["settings"]["slideshow_interval_ms"]
+        )
+        normalized = normalize_settings(normalized)
+        state["settings"] = normalized
+
+    persist_settings(normalized)
+    return jsonify({"success": True, "settings": normalized})
+
+
+@app.route("/api/speed", methods=["POST"])
+def set_speed():
+    data = request.get_json(force=True)
+    try:
+        ms = int(data.get("slideshow_interval_ms"))
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "error": "Invalid speed value"})
+
+    ms = max(MIN_SLIDESHOW_MS, min(MAX_SLIDESHOW_MS, ms))
+
+    with state_lock:
+        state["settings"]["slideshow_interval_ms"] = ms
+        settings_snapshot = dict(state["settings"])
+
+    persist_settings(settings_snapshot)
+    return jsonify({"success": True, "slideshow_interval_ms": ms})
+
+
+@app.route("/api/num_snapshots", methods=["POST"])
+def set_num_snapshots():
+    """Change how many snapshots are used for the folder currently being
+    reviewed (as opposed to /api/scan, which sets it for a brand-new scan)."""
+    data = request.get_json(force=True)
+    try:
+        n = int(data.get("num_snapshots"))
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "error": "Invalid snapshot count"})
+
+    n = max(MIN_NUM_SNAPSHOTS, min(MAX_NUM_SNAPSHOTS, n))
+
+    with state_lock:
+        state["num_snapshots"] = n
+        state["settings"]["default_num_snapshots"] = n
+        settings_snapshot = dict(state["settings"])
+
+    persist_settings(settings_snapshot)
+    return jsonify({"success": True, "num_snapshots": n})
+
+
+@app.route("/api/stop", methods=["POST"])
+def stop():
+    """Abandon the current folder/queue and go back to the folder picker."""
+    with state_lock:
+        state["folder"] = None
+        state["videos"] = []
+        state["current_index"] = 0
+    return jsonify({"success": True})
+
+
+@app.route("/api/scan", methods=["POST"])
+def scan():
+    data = request.get_json(force=True)
+    folder = (data.get("path") or "").strip().strip('"')
+
+    if not folder or not os.path.isdir(folder):
+        return jsonify({"success": False, "error": "That folder path could not be found."})
+
+    num_snapshots = data.get("num_snapshots", state["settings"]["default_num_snapshots"])
+    try:
+        num_snapshots = int(num_snapshots)
+    except (TypeError, ValueError):
+        num_snapshots = DEFAULT_NUM_SNAPSHOTS
+    num_snapshots = max(MIN_NUM_SNAPSHOTS, min(MAX_NUM_SNAPSHOTS, num_snapshots))
+
+    videos = []
+    with os.scandir(folder) as it:
+        for entry in it:
+            if entry.is_file():
+                ext = os.path.splitext(entry.name)[1].lower()
+                if ext in VIDEO_EXTENSIONS:
+                    videos.append({
+                        "id": make_id(entry.path),
+                        "filename": entry.name,
+                        "path": entry.path,
+                        "size": entry.stat().st_size,
+                        "status": "pending",
+                        "destination": None,
+                    })
+
+    videos.sort(key=lambda v: v["filename"].lower())
+
+    with state_lock:
+        state["folder"] = folder
+        state["videos"] = videos
+        state["current_index"] = 0
+        state["num_snapshots"] = num_snapshots
+        state["settings"]["default_num_snapshots"] = num_snapshots
+        settings_snapshot = dict(state["settings"])
+
+    persist_settings(settings_snapshot)  # remember this snapshot count for next time
+
+    return jsonify({
+        "success": True,
+        "count": len(videos),
+        "videos": videos,
+        "num_snapshots": num_snapshots,
+        "settings": settings_snapshot,
+    })
+
+
+@app.route("/api/status")
+def status():
+    with state_lock:
+        total = len(state["videos"])
+        done = sum(1 for v in state["videos"] if v["status"] != "pending")
+        return jsonify({
+            "folder": state["folder"],
+            "videos": state["videos"],
+            "current_index": state["current_index"],
+            "total": total,
+            "done": done,
+            "percent": round((done / total) * 100, 1) if total else 0,
+            "num_snapshots": state["num_snapshots"],
+            "settings": state["settings"],
+        })
+
+
+def _probe_video(path):
+    """Read frame count / fps once so seek strategies below don't each reopen blind."""
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return 0, 0.0
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
+    return frame_count, fps
+
+
+def _try_seek_and_read(path, seek_fn):
+    """Open a fresh capture, apply one seek strategy, and try to read a frame.
+    A fresh VideoCapture per attempt matters: once ffmpeg's demuxer gets confused
+    on a bad seek (the 'packet read max attempts exceeded' case) the same capture
+    object tends to keep failing, so retrying on a clean handle is what actually
+    recovers instead of just spamming the same warning."""
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return None
+    try:
+        seek_fn(cap)
+        ok, frame = cap.read()
+        if ok and frame is not None:
+            return frame
+    except Exception:
+        pass
+    finally:
+        cap.release()
+    return None
+
+
+def _try_sequential_read(path, target_frame, max_frames_scanned=4000):
+    """Very last resort before giving up: read frames one at a time from the
+    very start instead of seeking anywhere. Slower, but it never asks the
+    demuxer to jump — which is what trips up files with a badly broken
+    keyframe index even after raising the read-attempts limit. Capped so a
+    huge file can't stall a request for too long."""
+    if target_frame <= 0:
+        target_frame = 0
+    scan_limit = min(target_frame, max_frames_scanned)
+
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return None
+    frame = None
+    try:
+        for _ in range(scan_limit + 1):
+            ok, f = cap.read()
+            if not ok or f is None:
+                break
+            frame = f
+    except Exception:
+        pass
+    finally:
+        cap.release()
+    return frame
+
+
+def grab_frame(path, ratio):
+    """Try several ways to grab a frame near `ratio` (0..1) through the video.
+    Different containers/codecs (VFR footage, extra audio streams, odd
+    keyframe spacing, etc.) respond reliably to different seek methods, so we
+    fall through several before giving up."""
+    frame_count, fps = _probe_video(path)
+    duration_ms = (frame_count / fps) * 1000.0 if frame_count > 0 and fps and fps > 0 else None
+    ratio = min(max(ratio, 0.0), 1.0)
+
+    strategies = []
+
+    if duration_ms:
+        target_ms = max(0.0, min(duration_ms * ratio, duration_ms - 1))
+        strategies.append(lambda cap, ms=target_ms: cap.set(cv2.CAP_PROP_POS_MSEC, ms))
+
+    if frame_count > 0:
+        target_frame = max(0, min(int(frame_count * ratio), frame_count - 1))
+        strategies.append(lambda cap, f=target_frame: cap.set(cv2.CAP_PROP_POS_FRAMES, f))
+
+    strategies.append(lambda cap, r=ratio: cap.set(cv2.CAP_PROP_POS_AVI_RATIO, min(r, 0.999)))
+    # Last resort among the seek-based strategies: just grab whatever frame
+    # comes first, rather than showing nothing.
+    strategies.append(lambda cap: cap.set(cv2.CAP_PROP_POS_FRAMES, 0))
+
+    for seek_fn in strategies:
+        frame = _try_seek_and_read(path, seek_fn)
+        if frame is not None:
+            return frame
+
+    # Every seek-based attempt failed — fall back to reading sequentially
+    # from the start, which sidesteps seeking entirely.
+    target_frame = int(frame_count * ratio) if frame_count > 0 else 0
+    return _try_sequential_read(path, target_frame)
+
+
+def make_placeholder_frame(width=640, height=360):
+    """A small dark 'preview unavailable' frame, used for the rare video that
+    fails every seek strategy, so the slideshow shows something clean instead
+    of a broken image and can still move on."""
+    frame = np.full((height, width, 3), 24, dtype=np.uint8)
+    text = "Preview unavailable"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (tw, th), _ = cv2.getTextSize(text, font, 0.7, 2)
+    x = max(0, (width - tw) // 2)
+    y = (height + th) // 2
+    cv2.putText(frame, text, (x, y), font, 0.7, (140, 140, 140), 2, cv2.LINE_AA)
+    return frame
+
+
+@app.route("/api/thumbnail/<vid>/<int:idx>")
+def thumbnail(vid, idx):
+    with state_lock:
+        video = find_video(vid)
+        num_snapshots = state["num_snapshots"]
+
+    if not video:
+        return "", 404
+    if idx < 0 or idx >= num_snapshots:
+        return "", 400
+    if not os.path.isfile(video["path"]):
+        return "", 404
+
+    mtime = os.path.getmtime(video["path"])
+    cache_key = hashlib.sha1(f"{video['path']}|{mtime}|{idx}|{num_snapshots}".encode()).hexdigest()
+    cache_file = CACHE_DIR / f"{cache_key}.jpg"
+
+    if cache_file.exists():
+        return send_file(cache_file, mimetype="image/jpeg", max_age=3600)
+
+    ratio = (idx + 1) / num_snapshots  # e.g. 5%, 10%, ... 100% for 20 snapshots
+
+    # Only one thread may decode this particular file at a time (see
+    # _get_video_lock) — this is what actually fixes the corruption/hang,
+    # not just the timeout below. The timeout still matters as a backstop
+    # for a single genuinely broken read.
+    with _get_video_lock(video["path"]):
+        frame = run_with_timeout(lambda: grab_frame(video["path"], ratio))
+    timed_out_or_failed = frame is None
+    if frame is None:
+        frame = make_placeholder_frame()
+
+    h, w = frame.shape[:2]
+    max_w = 640
+    if w > max_w:
+        scale = max_w / w
+        frame = cv2.resize(frame, (max_w, int(h * scale)))
+
+    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 82])
+    if not ok:
+        return "", 500
+
+    jpeg_bytes = buf.tobytes()
+
+    if timed_out_or_failed:
+        # Don't cache the placeholder: a video that timed out this time may
+        # still succeed on a later request, so don't lock in the failure.
+        from flask import Response
+        return Response(jpeg_bytes, mimetype="image/jpeg")
+
+    cache_file.write_bytes(jpeg_bytes)
+    return send_file(cache_file, mimetype="image/jpeg", max_age=3600)
+
+
+@app.route("/api/action", methods=["POST"])
+def action():
+    data = request.get_json(force=True)
+    vid = data.get("id")
+    act = data.get("action")  # 'delete', 'keep', or a sort button's id
+
+    with state_lock:
+        video = find_video(vid)
+        if not video:
+            return jsonify({"success": False, "error": "Video not found"})
+        if video["status"] != "pending":
+            return jsonify({"success": False, "error": "Video already processed"})
+
+        settings = state["settings"]
+
+        try:
+            if act == "delete":
+                send2trash(video["path"])
+                video["status"] = "deleted"
+
+            elif act == "keep":
+                video["status"] = "kept"
+
+            elif act == "skip":
+                # Just move past it — no file operation at all. Used as the
+                # escape hatch for a video that's hanging or won't preview.
+                video["status"] = "skipped"
+
+            else:
+                button = next((b for b in settings["sort_buttons"] if b["id"] == act), None)
+                if not button:
+                    return jsonify({"success": False, "error": "Unknown action"})
+
+                folder = button["folder"]
+                subdir = os.path.join(state["folder"], folder)
+                os.makedirs(subdir, exist_ok=True)
+                dest = os.path.join(subdir, video["filename"])
+                if os.path.exists(dest):
+                    base, ext = os.path.splitext(video["filename"])
+                    dest = os.path.join(subdir, f"{base}_{int(time.time())}{ext}")
+                shutil.move(video["path"], dest)
+                video["path"] = dest
+                video["status"] = "moved"
+                video["destination"] = folder
+
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)})
+
+        state["current_index"] += 1
+
+    return jsonify({"success": True})
+
+
+if __name__ == "__main__":
+    PORT = 5000
+    url = f"http://127.0.0.1:{PORT}"
+    threading.Timer(1.2, lambda: webbrowser.open(url)).start()
+    print(f"\n  VideoReviewTool running at {url}\n  Press CTRL+C to stop.\n")
+    # threaded=True is the actual fix for the "app stops registering
+    # keypresses" freeze: Flask's dev server is single-threaded by default,
+    # so one thumbnail request stuck on a broken video queues up every other
+    # request (including Delete/Keep/Skip) behind it. With threading on,
+    # a stuck request can no longer block the rest of the app.
+    app.run(host="127.0.0.1", port=PORT, debug=False, threaded=True)

@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VideoReviewTool</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<div class="app">
+
+  <!-- ===================== SETUP SCREEN ===================== -->
+  <section id="setup-screen" class="screen">
+    <div class="setup-card">
+      <div class="brand">
+        <span class="brand-mark">▤</span>
+        <div>
+          <h1>VideoReviewTool</h1>
+          <p class="subtitle">Skim, sort and clean a folder of video files in seconds.</p>
+        </div>
+      </div>
+
+      <div id="dropzone" class="dropzone">
+        <p class="dropzone-title">Drop a folder here</p>
+        <p class="dropzone-hint">Browsers can't read a real disk path from a drag-and-drop action,
+          so use the button below to choose the folder reliably — or paste the path directly.</p>
+        <button id="browse-btn" class="btn btn-primary">Browse for folder…</button>
+      </div>
+
+      <div class="path-row">
+        <input id="path-input" type="text" placeholder="Or paste a folder path, e.g. C:\Videos\Inbox" />
+        <button id="scan-btn" class="btn btn-secondary">Scan folder</button>
+      </div>
+
+      <div class="snapshot-row">
+        <label for="snapshot-count">Snapshots per video</label>
+        <div class="snapshot-controls">
+          <select id="snapshot-preset">
+            <option value="10">10</option>
+            <option value="20" selected>20</option>
+            <option value="25">25</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+            <option value="custom">Custom…</option>
+          </select>
+          <input id="snapshot-count" type="number" min="2" max="100" value="20" />
+          <span id="snapshot-interval" class="snapshot-interval">every 5%</span>
+        </div>
+      </div>
+
+      <div class="snapshot-row">
+        <label for="speed-count">Slideshow speed</label>
+        <div class="snapshot-controls">
+          <select id="speed-preset">
+            <option value="450">Slow</option>
+            <option value="225" selected>Normal</option>
+            <option value="120">Fast</option>
+            <option value="60">Very fast</option>
+            <option value="custom">Custom…</option>
+          </select>
+          <input id="speed-count" type="number" min="50" max="3000" step="10" value="225" />
+          <span id="speed-label" class="snapshot-interval">225 ms/frame</span>
+        </div>
+      </div>
+
+      <button id="toggle-settings-btn" class="btn btn-secondary btn-block">⚙ Customize buttons &amp; folders</button>
+
+      <div id="settings-editor" class="settings-editor hidden">
+        <div class="settings-row settings-row-fixed">
+          <input type="text" id="delete-key-input" class="key-input" maxlength="1" value="D">
+          <span class="settings-row-label">Delete</span>
+          <span class="settings-row-desc">sends the file to the Recycle Bin / Trash</span>
+        </div>
+        <div class="settings-row settings-row-fixed">
+          <input type="text" id="keep-key-input" class="key-input" maxlength="1" value="K">
+          <span class="settings-row-label">Keep</span>
+          <span class="settings-row-desc">leaves the file where it is, no changes</span>
+        </div>
+
+        <div id="sort-buttons-list" class="sort-buttons-list"></div>
+
+        <button id="add-sort-btn" class="btn btn-secondary btn-small">+ Add button</button>
+
+        <div class="settings-actions">
+          <button id="save-settings-btn" class="btn btn-primary btn-small">Save settings</button>
+          <button id="reset-settings-btn" class="btn btn-secondary btn-small">Reset to defaults</button>
+        </div>
+        <p id="settings-message" class="message"></p>
+      </div>
+
+      <p id="setup-message" class="message"></p>
+
+      <div id="scan-results" class="scan-results hidden">
+        <h2 id="scan-count"></h2>
+        <ul id="scan-list" class="scan-list"></ul>
+        <button id="start-btn" class="btn btn-primary btn-large">Start reviewing →</button>
+      </div>
+
+      <p class="footnote">Supported formats: .mp4, .avi, .mov, .mkv, .webm, .flv, .wmv, .m4v, .mpg, .mpeg, .ts</p>
+    </div>
+  </section>
+
+  <!-- ===================== REVIEW SCREEN ===================== -->
+  <section id="review-screen" class="screen hidden">
+
+    <header class="topbar">
+      <div class="topbar-left">
+        <span class="brand-mark small">▤</span>
+        <strong>VideoReviewTool</strong>
+      </div>
+      <div class="topbar-right">
+        <div class="progress-wrap">
+          <div class="progress-track">
+            <div id="progress-fill" class="progress-fill" style="width:0%"></div>
+          </div>
+          <span id="progress-label" class="progress-label">0 / 0 · 0%</span>
+        </div>
+        <button id="stop-btn" class="btn btn-secondary btn-small">← Back to folder picker</button>
+      </div>
+    </header>
+
+    <div class="main-layout">
+
+      <!-- Preview -->
+      <main class="preview-pane">
+        <div class="preview-frame">
+          <img id="preview-img" alt="Video snapshot preview">
+          <div id="preview-loading" class="preview-loading">Loading previews…</div>
+          <div class="frame-indicator">
+            <span id="frame-index">1</span> / <span id="frame-total">20</span>
+            <span class="frame-percent" id="frame-percent">(5%)</span>
+          </div>
+        </div>
+
+        <div class="scrubber-row">
+          <input type="range" id="frame-scrubber" min="0" max="19" value="0" step="1" disabled>
+        </div>
+
+        <div class="current-file">
+          <div class="current-file-name" id="current-filename">—</div>
+          <div class="current-file-meta" id="current-filemeta">—</div>
+        </div>
+
+        <button id="skip-btn" class="btn btn-secondary" title="Move on without deleting, keeping, or moving this file">
+          Skip this video <kbd style="margin-left:6px;">Esc</kbd>
+        </button>
+      </main>
+
+      <!-- Sidebar -->
+      <aside class="sidebar">
+
+        <div class="panel">
+          <h3>Playback</h3>
+          <div class="playback-settings">
+            <div class="playback-row">
+              <label for="review-snapshot-count">Snapshots per video</label>
+              <div class="playback-controls">
+                <select id="review-snapshot-preset">
+                  <option value="10">10</option>
+                  <option value="20" selected>20</option>
+                  <option value="25">25</option>
+                  <option value="50">50</option>
+                  <option value="100">100</option>
+                  <option value="custom">Custom…</option>
+                </select>
+                <input id="review-snapshot-count" type="number" min="2" max="100" value="20" />
+              </div>
+              <span id="review-snapshot-interval" class="snapshot-interval">every 5%</span>
+            </div>
+            <div class="playback-row">
+              <label for="review-speed-count">Slideshow speed</label>
+              <div class="playback-controls">
+                <select id="review-speed-preset">
+                  <option value="450">Slow</option>
+                  <option value="225" selected>Normal</option>
+                  <option value="120">Fast</option>
+                  <option value="60">Very fast</option>
+                  <option value="custom">Custom…</option>
+                </select>
+                <input id="review-speed-count" type="number" min="50" max="3000" step="10" value="225" />
+              </div>
+              <span id="review-speed-label" class="snapshot-interval">225 ms/frame</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h3>Controls</h3>
+          <ul id="key-legend" class="key-legend"></ul>
+        </div>
+
+        <div class="panel">
+          <h3>Queue</h3>
+          <ul id="queue-list" class="queue-list"></ul>
+        </div>
+
+      </aside>
+    </div>
+  </section>
+
+  <!-- ===================== DONE SCREEN ===================== -->
+  <section id="done-screen" class="screen hidden">
+    <div class="setup-card done-card">
+      <span class="brand-mark">✓</span>
+      <h1>All videos processed</h1>
+      <p class="subtitle" id="done-summary"></p>
+      <button id="restart-btn" class="btn btn-primary">Review another folder</button>
+    </div>
+  </section>
+
+</div>
+
+<script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
