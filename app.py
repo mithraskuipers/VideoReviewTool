@@ -66,8 +66,80 @@ DEFAULT_SLIDESHOW_MS = 225  # 2x faster than the original 450ms default
 MIN_SLIDESHOW_MS = 50
 MAX_SLIDESHOW_MS = 3000
 
-CACHE_DIR = Path.home() / ".video_review_tool_cache"
-CACHE_DIR.mkdir(exist_ok=True)
+# --------------------------------------------------------------------------
+# Per-folder cache & trash directories.
+#
+# Snapshots (and, briefly, deleted-but-undoable files) are stashed in hidden
+# subdirectories created *inside the folder being reviewed* rather than in
+# one big directory under the user's home folder. That way:
+#   - snapshots for a video disappear as soon as that video is processed
+#     (see cleanup_video_cache), so the cache directory shrinks steadily
+#     as you work through a folder instead of growing forever;
+#   - the cache directory is removed entirely once every video in the
+#     folder has been processed;
+#   - nothing is left behind in an unrelated, ever-growing home-folder
+#     cache that the user never sees and has to remember to clear.
+# --------------------------------------------------------------------------
+
+CACHE_DIRNAME = ".videoreviewtool_cache"
+TRASH_DIRNAME = ".videoreviewtool_trash"
+
+
+def _hide_on_windows(path):
+    """Best-effort: mark a directory hidden on Windows so it doesn't clutter
+    Explorer. Dot-prefixed names already hide it everywhere else."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            FILE_ATTRIBUTE_HIDDEN = 0x02
+            ctypes.windll.kernel32.SetFileAttributesW(str(path), FILE_ATTRIBUTE_HIDDEN)
+        except Exception:
+            pass
+
+
+def _cache_dir_path(folder):
+    return Path(folder) / CACHE_DIRNAME
+
+
+def _trash_dir_path(folder):
+    return Path(folder) / TRASH_DIRNAME
+
+
+def get_cache_dir(folder):
+    """Return the snapshot cache directory for `folder`, creating it if
+    needed."""
+    d = _cache_dir_path(folder)
+    d.mkdir(exist_ok=True)
+    _hide_on_windows(d)
+    return d
+
+
+def get_trash_dir(folder):
+    """Return the holding directory used to make the most recent Delete
+    undoable, creating it if needed."""
+    d = _trash_dir_path(folder)
+    d.mkdir(exist_ok=True)
+    _hide_on_windows(d)
+    return d
+
+
+def _rmdir_if_empty(path):
+    path = Path(path)
+    try:
+        if path.exists() and not any(path.iterdir()):
+            path.rmdir()
+    except OSError:
+        pass
+
+
+def remove_folder_dirs(folder):
+    """Tear down both hidden subdirectories for a folder we're done with
+    (or leaving) — used when a folder finishes review, and when the person
+    stops/switches folders."""
+    if not folder:
+        return
+    shutil.rmtree(_cache_dir_path(folder), ignore_errors=True)
+    _rmdir_if_empty(_trash_dir_path(folder))
 
 
 # --------------------------------------------------------------------------
@@ -92,20 +164,23 @@ def cache_filename(video_id, mtime, idx, num_snapshots):
     return f"{video_id}__{mtime_key}__{idx}__{num_snapshots}.jpg"
 
 
-def cache_path(video_id, mtime, idx, num_snapshots):
-    return CACHE_DIR / cache_filename(video_id, mtime, idx, num_snapshots)
+def cache_path(cache_dir, video_id, mtime, idx, num_snapshots):
+    return Path(cache_dir) / cache_filename(video_id, mtime, idx, num_snapshots)
 
 
-def cleanup_video_cache(video_id):
+def cleanup_video_cache(cache_dir, video_id):
     """Delete every cached snapshot image for this video, no matter which
     mtime/snapshot-count combination produced it. Called once a video has
     been processed (deleted/kept/moved/skipped) so the cache doesn't sit
-    around holding thumbnails for files we're already done with."""
-    for f in CACHE_DIR.glob(f"{video_id}__*.jpg"):
+    around holding thumbnails for files we're already done with. Also
+    shrinks away the cache directory itself once it's empty."""
+    cache_dir = Path(cache_dir)
+    for f in cache_dir.glob(f"{video_id}__*.jpg"):
         try:
             f.unlink()
         except OSError:
             pass
+    _rmdir_if_empty(cache_dir)
 
 # --------------------------------------------------------------------------
 # Hard per-frame timeout.
@@ -252,8 +327,38 @@ state = {
     "current_index": 0,
     "num_snapshots": DEFAULT_NUM_SNAPSHOTS,
     "settings": load_settings(),
+    "last_action": None,  # the most recent action, kept around so it can be undone (see /api/undo)
 }
 state["num_snapshots"] = state["settings"]["default_num_snapshots"]
+
+
+def _unique_dest(dest_path):
+    """If dest_path already exists, append a timestamp so we never clobber
+    an existing file when moving something onto it."""
+    dest_path = Path(dest_path)
+    if not dest_path.exists():
+        return dest_path
+    return dest_path.with_name(f"{dest_path.stem}_{int(time.time())}{dest_path.suffix}")
+
+
+def finalize_pending_delete():
+    """If the previous action was a Delete, the file has been sitting in
+    the folder's hidden trash-holding directory (not the real OS Recycle
+    Bin / Trash yet) purely so it could still be undone. Once it's no
+    longer the most recent action — because another action happened, or
+    the session is ending — actually send it to the OS trash for real.
+    Must be called with state_lock held; safe to call unconditionally."""
+    record = state.get("last_action")
+    state["last_action"] = None
+    if not record or record.get("type") != "delete":
+        return
+    held_path = record.get("held_path")
+    if held_path and os.path.exists(held_path):
+        try:
+            send2trash(held_path)
+        except Exception:
+            pass
+        _rmdir_if_empty(Path(held_path).parent)
 
 
 def make_id(path: str) -> str:
@@ -373,9 +478,12 @@ def set_num_snapshots():
 def stop():
     """Abandon the current folder/queue and go back to the folder picker."""
     with state_lock:
+        finalize_pending_delete()
+        folder = state["folder"]
         state["folder"] = None
         state["videos"] = []
         state["current_index"] = 0
+    remove_folder_dirs(folder)
     return jsonify({"success": True})
 
 
@@ -392,6 +500,7 @@ def list_videos_in_folder(folder):
     shape used everywhere else (id/filename/path/size/status/...). Shared by
     /api/scan, /api/prepare, and the --prepare CLI path so there's exactly
     one definition of what counts as a video and how its id is derived."""
+    cache_dir = str(get_cache_dir(folder))
     videos = []
     with os.scandir(folder) as it:
         for entry in it:
@@ -406,6 +515,7 @@ def list_videos_in_folder(folder):
                         "status": "pending",
                         "destination": None,
                         "broken": False,  # set True once every read strategy has been tried and failed
+                        "cache_dir": cache_dir,  # where this video's snapshots live (inside `folder`)
                     })
     videos.sort(key=lambda v: v["filename"].lower())
     return videos
@@ -426,12 +536,17 @@ def scan():
     videos = list_videos_in_folder(folder)
 
     with state_lock:
+        finalize_pending_delete()
+        prev_folder = state["folder"]
         state["folder"] = folder
         state["videos"] = videos
         state["current_index"] = 0
         state["num_snapshots"] = num_snapshots
         state["settings"]["default_num_snapshots"] = num_snapshots
         settings_snapshot = dict(state["settings"])
+
+    if prev_folder and prev_folder != folder:
+        remove_folder_dirs(prev_folder)
 
     persist_settings(settings_snapshot)  # remember this snapshot count for next time
 
@@ -449,6 +564,12 @@ def status():
     with state_lock:
         total = len(state["videos"])
         done = sum(1 for v in state["videos"] if v["status"] != "pending")
+        last_action = state.get("last_action")
+        undo_info = None
+        if last_action:
+            v = find_video(last_action["video_id"])
+            if v:
+                undo_info = {"filename": v["filename"], "type": last_action["type"]}
         return jsonify({
             "folder": state["folder"],
             "videos": state["videos"],
@@ -458,6 +579,8 @@ def status():
             "percent": round((done / total) * 100, 1) if total else 0,
             "num_snapshots": state["num_snapshots"],
             "settings": state["settings"],
+            "can_undo": undo_info is not None,
+            "undo_info": undo_info,
         })
 
 
@@ -569,10 +692,12 @@ def make_placeholder_frame(width=640, height=360):
     return frame
 
 
-def _encode_and_cache(video_id, mtime, idx, num_snapshots, frame):
+def _encode_and_cache(cache_dir, video_id, mtime, idx, num_snapshots, frame):
     """Resize, JPEG-encode, and write one frame to its cache slot. Returns
     True if it wrote (or already had) a cache file for this idx."""
-    cache_file = cache_path(video_id, mtime, idx, num_snapshots)
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(exist_ok=True)  # may have been shrunk away since we started
+    cache_file = cache_path(cache_dir, video_id, mtime, idx, num_snapshots)
     if cache_file.exists():
         return True
     h, w = frame.shape[:2]
@@ -682,7 +807,7 @@ def _sequential_batch_fill(video, num_snapshots, want_idx):
 
     mtime = os.path.getmtime(path)
     for i, frame in results.items():
-        _encode_and_cache(video["id"], mtime, i, num_snapshots, frame)
+        _encode_and_cache(video["cache_dir"], video["id"], mtime, i, num_snapshots, frame)
 
     return want_idx in results
 
@@ -710,7 +835,10 @@ def ensure_thumbnail_cached(video, idx, num_snapshots):
         return None
 
     mtime = os.path.getmtime(video["path"])
-    cache_file = cache_path(video["id"], mtime, idx, num_snapshots)
+    cache_dir = Path(video["cache_dir"])
+    cache_dir.mkdir(exist_ok=True)  # may have been shrunk away since we started
+    _hide_on_windows(cache_dir)
+    cache_file = cache_path(cache_dir, video["id"], mtime, idx, num_snapshots)
     if cache_file.exists():
         return cache_file
 
@@ -746,7 +874,7 @@ def ensure_thumbnail_cached(video, idx, num_snapshots):
                     v["broken"] = True
             return None
 
-        if _encode_and_cache(video["id"], mtime, idx, num_snapshots, frame):
+        if _encode_and_cache(cache_dir, video["id"], mtime, idx, num_snapshots, frame):
             return cache_file
         return None
 
@@ -798,12 +926,28 @@ def action():
         if video["status"] != "pending":
             return jsonify({"success": False, "error": "Video already processed"})
 
+        # The action we're about to record becomes the new "last action";
+        # whatever *was* last is no longer undoable, so if it was a Delete
+        # being held for that purpose, send it to the real OS trash now.
+        finalize_pending_delete()
+
         settings = state["settings"]
+        orig_path = video["path"]
+        record = {"video_id": video["id"], "type": act if act in ("delete", "keep", "skip", "auto_skip") else "move"}
 
         try:
             if act == "delete":
-                send2trash(video["path"])
+                # Held in a hidden per-folder trash dir (not the OS trash
+                # yet) so this can still be undone with Backspace. It's
+                # finalized for real the next time finalize_pending_delete()
+                # runs — i.e. on the next action, or when the session ends.
+                trash_dir = get_trash_dir(state["folder"])
+                held_path = _unique_dest(trash_dir / video["filename"])
+                shutil.move(orig_path, str(held_path))
+                video["path"] = str(held_path)
                 video["status"] = "deleted"
+                record["orig_path"] = orig_path
+                record["held_path"] = str(held_path)
 
             elif act == "keep":
                 video["status"] = "kept"
@@ -829,25 +973,84 @@ def action():
                 folder = button["folder"]
                 subdir = os.path.join(state["folder"], folder)
                 os.makedirs(subdir, exist_ok=True)
-                dest = os.path.join(subdir, video["filename"])
-                if os.path.exists(dest):
-                    base, ext = os.path.splitext(video["filename"])
-                    dest = os.path.join(subdir, f"{base}_{int(time.time())}{ext}")
-                shutil.move(video["path"], dest)
+                dest = str(_unique_dest(Path(subdir) / video["filename"]))
+                shutil.move(orig_path, dest)
                 video["path"] = dest
                 video["status"] = "moved"
                 video["destination"] = folder
+                record["orig_path"] = orig_path
+                record["dest_path"] = dest
 
         except Exception as e:
             return jsonify({"success": False, "error": str(e)})
 
         state["current_index"] += 1
+        state["last_action"] = record
+        cache_dir = video["cache_dir"]
+        folder = state["folder"]
 
     # Done with this video one way or another — its cached snapshot images
     # (whether generated live during review, or ahead of time by prepare
     # mode) are no longer needed, regardless of which snapshot count(s)
-    # they were generated at.
-    cleanup_video_cache(video["id"])
+    # they were generated at. This also shrinks the cache directory away
+    # once nothing remains inside it.
+    cleanup_video_cache(cache_dir, video["id"])
+
+    with state_lock:
+        all_done = folder == state["folder"] and not any(v["status"] == "pending" for v in state["videos"])
+
+    if all_done:
+        # The whole folder has been processed — remove the cache subdir
+        # outright (it should already be empty from per-video cleanup, but
+        # this catches any stragglers, e.g. from prepare-mode runs at a
+        # different snapshot count).
+        shutil.rmtree(_cache_dir_path(folder), ignore_errors=True)
+
+    return jsonify({"success": True})
+
+
+@app.route("/api/undo", methods=["POST"])
+def undo():
+    """Reverse the single most recent action. Only one level of undo is
+    kept — performing (or undoing) an action clears it, so Backspace always
+    means "undo whatever I just did", not a full history stack."""
+    with state_lock:
+        record = state.get("last_action")
+        if not record:
+            return jsonify({"success": False, "error": "Nothing to undo."})
+
+        video = find_video(record["video_id"])
+        if not video:
+            state["last_action"] = None
+            return jsonify({"success": False, "error": "That video is no longer in the queue."})
+
+        try:
+            if record["type"] == "delete":
+                orig_path = record["orig_path"]
+                held_path = record["held_path"]
+                if os.path.exists(held_path):
+                    shutil.move(held_path, orig_path)
+                video["path"] = orig_path
+
+            elif record["type"] == "move":
+                orig_path = record["orig_path"]
+                dest_path = record["dest_path"]
+                if os.path.exists(dest_path):
+                    shutil.move(dest_path, orig_path)
+                video["path"] = orig_path
+                video["destination"] = None
+
+            # keep / skip / auto_skip performed no file operation, so there's
+            # nothing to reverse beyond resetting status below.
+
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)})
+
+        video["status"] = "pending"
+        video["broken"] = False
+        if state["current_index"] > 0:
+            state["current_index"] -= 1
+        state["last_action"] = None
 
     return jsonify({"success": True})
 

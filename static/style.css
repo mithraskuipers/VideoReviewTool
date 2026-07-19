@@ -403,7 +403,12 @@ kbd {
 .badge.skipped { background: rgba(139,147,163,0.18); color: var(--text-dim); }
 .badge.auto_skipped { background: rgba(224,100,92,0.12); color: var(--danger); }
 
-#skip-btn { width: 100%; max-width: 900px; }
+.action-row { display: flex; gap: 10px; width: 100%; max-width: 900px; }
+.action-row .btn { flex: 1; }
+.action-row .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+#done-undo-btn { margin: 14px 0 0; }
+#done-undo-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 
 @media (max-width: 860px) {
   .main-layout { grid-template-columns: 1fr; height: auto; }

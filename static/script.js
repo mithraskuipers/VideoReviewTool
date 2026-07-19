@@ -79,6 +79,8 @@ const reviewSpeedLabel = document.getElementById('review-speed-label');
 const stopBtn = document.getElementById('stop-btn');
 const frameScrubber = document.getElementById('frame-scrubber');
 const skipBtn = document.getElementById('skip-btn');
+const undoBtn = document.getElementById('undo-btn');
+const doneUndoBtn = document.getElementById('done-undo-btn');
 
 const toggleSettingsBtn = document.getElementById('toggle-settings-btn');
 const settingsEditor = document.getElementById('settings-editor');
@@ -504,6 +506,7 @@ function renderLegend(settings) {
   let html = `<li><kbd>${escapeHtml(settings.delete_key.toUpperCase())}</kbd><span>Delete file <em>(sent to Recycle Bin / Trash)</em></span></li>`;
   html += `<li><kbd>${escapeHtml(settings.keep_key.toUpperCase())}</kbd><span>Keep <em>(leave in place, no changes)</em></span></li>`;
   html += `<li><kbd>Esc</kbd><span>Skip <em>(move on, no changes — for stuck/broken videos)</em></span></li>`;
+  html += `<li><kbd>⌫</kbd><span>Undo <em>(reverse the previous action and go back)</em></span></li>`;
   html += `<li><span style="width:26px;text-align:center;color:var(--text-dim);font-size:11px;">auto</span><span>Unreadable files are skipped automatically <em>(listed below)</em></span></li>`;
   settings.sort_buttons.forEach(b => {
     html += `<li><kbd>${escapeHtml(b.key.toUpperCase())}</kbd><span>Move to subfolder <b>/${escapeHtml(b.folder)}</b></span></li>`;
@@ -746,11 +749,16 @@ async function refreshStatus() {
   renderQueue(data);
   renderUnreadable(data);
   renderProgress(data);
+  renderUndoButtons(data);
 
   if (data.total > 0 && data.current_index >= data.total) {
     showDone(data);
     return;
   }
+
+  // In case we just undid our way back from the Done screen.
+  doneScreen.classList.add('hidden');
+  reviewScreen.classList.remove('hidden');
 
   const next = data.videos[data.current_index];
   if (!next) return;
@@ -764,6 +772,20 @@ async function refreshStatus() {
 function renderProgress(data) {
   progressFill.style.width = data.percent + '%';
   progressLabel.textContent = `${data.done} / ${data.total} · ${data.percent}%`;
+}
+
+function renderUndoButtons(data) {
+  const canUndo = !!data.can_undo;
+  const label = canUndo && data.undo_info
+    ? `↶ Undo: ${data.undo_info.filename}`
+    : '↶ Undo last action';
+  [undoBtn, doneUndoBtn].forEach(btn => {
+    if (!btn) return;
+    btn.disabled = !canUndo;
+    btn.innerHTML = btn === undoBtn
+      ? `${escapeHtml(label)} <kbd style="margin-left:6px;">⌫</kbd>`
+      : escapeHtml(label);
+  });
 }
 
 function renderQueue(data) {
@@ -912,7 +934,7 @@ function showDone(data) {
 }
 
 async function performAction(act) {
-  if (busy || !currentVideo) return;
+  if (busy || undoing || !currentVideo) return;
   busy = true;
   try {
     const res = await fetch('/api/action', {
@@ -936,8 +958,49 @@ async function performAction(act) {
 
 skipBtn.addEventListener('click', () => performAction('skip'));
 
+let undoing = false; // guard against double-firing, same idea as `busy` for performAction
+
+async function performUndo() {
+  if (undoing || busy) return;
+  undoing = true;
+  try {
+    const res = await fetch('/api/undo', { method: 'POST' });
+    const data = await res.json();
+    if (data.success) {
+      stopSlideshow();
+      stopBrokenPoll();
+      currentImages = null;
+      loadToken++; // invalidate any in-flight thumbnail loads
+      currentVideo = null; // force the (now-pending-again) video to reload
+      await refreshStatus();
+    }
+    // On failure (nothing to undo) there's nothing to show — the button
+    // is disabled in that state anyway, this just guards manual retries.
+  } finally {
+    undoing = false;
+  }
+}
+
+if (undoBtn) undoBtn.addEventListener('click', performUndo);
+if (doneUndoBtn) doneUndoBtn.addEventListener('click', performUndo);
+
 document.addEventListener('keydown', (e) => {
-  if (reviewScreen.classList.contains('hidden')) return;
+  const tag = (e.target && e.target.tagName) || '';
+  const isFormField = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+
+  const onReview = !reviewScreen.classList.contains('hidden');
+  const onDone = !doneScreen.classList.contains('hidden');
+
+  // Backspace undoes the previous action from either the review screen or
+  // the done screen (so an accidental last action can still be reversed),
+  // but never while the person is actually typing in a text field.
+  if (e.key === 'Backspace' && !isFormField && (onReview || onDone)) {
+    e.preventDefault();
+    performUndo();
+    return;
+  }
+
+  if (!onReview) return;
 
   // Skip always works, regardless of settings and even while a preview is
   // still (or forever) loading — it's the escape hatch for a stuck video.

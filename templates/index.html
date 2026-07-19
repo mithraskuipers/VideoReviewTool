@@ -164,9 +164,14 @@
           <div class="current-file-meta" id="current-filemeta">—</div>
         </div>
 
-        <button id="skip-btn" class="btn btn-secondary" title="Move on without deleting, keeping, or moving this file">
-          Skip this video <kbd style="margin-left:6px;">Esc</kbd>
-        </button>
+        <div class="action-row">
+          <button id="undo-btn" class="btn btn-secondary" title="Undo the previous action" disabled>
+            ↶ Undo last action <kbd style="margin-left:6px;">⌫</kbd>
+          </button>
+          <button id="skip-btn" class="btn btn-secondary" title="Move on without deleting, keeping, or moving this file">
+            Skip this video <kbd style="margin-left:6px;">Esc</kbd>
+          </button>
+        </div>
       </main>
 
       <!-- Sidebar -->
@@ -250,6 +255,7 @@
       <span class="brand-mark">✓</span>
       <h1>All videos processed</h1>
       <p class="subtitle" id="done-summary"></p>
+      <button id="done-undo-btn" class="btn btn-secondary" title="Undo the previous action" disabled>↶ Undo last action</button>
       <button id="restart-btn" class="btn btn-primary">Review another folder</button>
 
       <div class="prepare-box" style="text-align:left; margin-top:26px; padding-top:22px; border-top:1px solid var(--border);">
