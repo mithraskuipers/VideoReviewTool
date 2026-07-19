@@ -39,6 +39,11 @@ const preparePanels = [
     currentFile: document.getElementById('prepare-current-file'),
     message: document.getElementById('prepare-message'),
     cancelBtn: document.getElementById('prepare-cancel-btn'),
+    // This is the only panel that operates on the folder you're about to
+    // review (the other two prime a *different, upcoming* folder in the
+    // background). So it's the only one that scans first and automatically
+    // drops you into review once every snapshot is ready.
+    autoReview: true,
   },
   {
     idleLabel: '⚡ Prepare snapshots',
@@ -528,7 +533,7 @@ async function doScan(path) {
   path = (path || '').trim();
   if (!path) {
     setupMessage.textContent = 'Choose or paste a folder path first.';
-    return;
+    return false;
   }
   setupMessage.textContent = '';
   scanResults.classList.add('hidden');
@@ -544,7 +549,7 @@ async function doScan(path) {
     const data = await res.json();
     if (!data.success) {
       setupMessage.textContent = data.error || 'Could not scan that folder.';
-      return;
+      return false;
     }
     NUM_SNAPSHOTS = data.num_snapshots || numSnapshots;
     frameTotalEl.textContent = NUM_SNAPSHOTS;
@@ -555,15 +560,17 @@ async function doScan(path) {
     scannedVideos = data.videos;
     if (data.count === 0) {
       setupMessage.textContent = 'No supported video files were found in that folder.';
-      return;
+      return false;
     }
     scanCount.textContent = `${data.count} video file${data.count === 1 ? '' : 's'} found`;
     scanList.innerHTML = scannedVideos.map(v =>
       `<li><span class="fname">${escapeHtml(v.filename)}</span><span class="fsize">${fmtSize(v.size)}</span></li>`
     ).join('');
     scanResults.classList.remove('hidden');
+    return true;
   } catch (e) {
     setupMessage.textContent = 'Could not reach the local server.';
+    return false;
   }
 }
 
@@ -586,6 +593,23 @@ function getPreferredNumSnapshots() {
   return clampSnapshotCount(n);
 }
 
+let preparingForReview = false; // true while the setup-screen "Prepare" panel is
+                                 // blocking Start-reviewing until every snapshot is ready
+const startBtnIdleLabel = startBtn.textContent;
+
+function setFolderControlsDisabled(disabled) {
+  browseBtn.disabled = disabled;
+  pathInput.disabled = disabled;
+  scanBtn.disabled = disabled;
+  // Only one prepare job can run on the backend at a time — keep the other
+  // two panels' buttons disabled too so a click there can't silently fail
+  // (or, worse, target a different folder while this one is still running).
+  preparePanels.forEach(p => {
+    if (p.autoReview) return;
+    if (p.btn) p.btn.disabled = disabled;
+  });
+}
+
 function wirePreparePanel(panel) {
   if (!panel.btn) return;
 
@@ -602,6 +626,22 @@ function wirePreparePanel(panel) {
     panel.btn.disabled = true;
     panel.btn.textContent = 'Starting…';
 
+    if (panel.autoReview) {
+      // Make sure the folder is actually scanned (sets up the video queue
+      // this session will review) before we start caching its snapshots.
+      setupMessage.textContent = '';
+      const scanned = await doScan(path);
+      if (!scanned) {
+        panel.btn.disabled = false;
+        panel.btn.textContent = panel.idleLabel;
+        return; // doScan() already reported the error/empty-folder message
+      }
+      preparingForReview = true;
+      startBtn.disabled = true;
+      startBtn.textContent = 'Preparing snapshots…';
+      setFolderControlsDisabled(true);
+    }
+
     try {
       const res = await fetch('/api/prepare', {
         method: 'POST',
@@ -613,6 +653,12 @@ function wirePreparePanel(panel) {
         panel.message.textContent = data.error || 'Could not start preparing that folder.';
         panel.btn.disabled = false;
         panel.btn.textContent = panel.idleLabel;
+        if (panel.autoReview) {
+          preparingForReview = false;
+          startBtn.disabled = false;
+          startBtn.textContent = startBtnIdleLabel;
+          setFolderControlsDisabled(false);
+        }
         return;
       }
       preparePanels.forEach(p => {
@@ -624,6 +670,12 @@ function wirePreparePanel(panel) {
       panel.message.textContent = 'Could not reach the local server.';
       panel.btn.disabled = false;
       panel.btn.textContent = panel.idleLabel;
+      if (panel.autoReview) {
+        preparingForReview = false;
+        startBtn.disabled = false;
+        startBtn.textContent = startBtnIdleLabel;
+        setFolderControlsDisabled(false);
+      }
     }
   });
 
@@ -697,12 +749,34 @@ function onPrepareFinished(data) {
     panel.message.style.color = 'var(--success)';
     panel.message.textContent = msg;
   });
+
+  if (preparingForReview) {
+    preparingForReview = false;
+    setFolderControlsDisabled(false);
+    if (!data.error && !data.cancelled) {
+      // Every snapshot is ready — go straight into reviewing this folder.
+      startBtn.disabled = false;
+      startBtn.textContent = startBtnIdleLabel;
+      enterReviewScreen();
+    } else {
+      // Cancelled or failed — stay on the setup screen; the scan results
+      // (and a manual Start button) are still right there if the person
+      // wants to review anyway, with whatever got cached before stopping.
+      startBtn.disabled = false;
+      startBtn.textContent = startBtnIdleLabel;
+    }
+  }
 }
 
-startBtn.addEventListener('click', () => {
+function enterReviewScreen() {
   setupScreen.classList.add('hidden');
   reviewScreen.classList.remove('hidden');
   refreshStatus();
+}
+
+startBtn.addEventListener('click', () => {
+  if (startBtn.disabled) return;
+  enterReviewScreen();
 });
 
 restartBtn.addEventListener('click', () => location.reload());
