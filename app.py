@@ -81,7 +81,8 @@ CACHE_DIR.mkdir(exist_ok=True)
 # that asked for it is never blocked longer than the timeout, and the pool
 # below caps how many stuck workers can pile up at once.
 # --------------------------------------------------------------------------
-FRAME_TIMEOUT_SECONDS = 6
+FRAME_TIMEOUT_SECONDS = 3
+SEQUENTIAL_BATCH_TIMEOUT_SECONDS = 45  # generous, but this only ever runs once per problem video
 _frame_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="frame-grab")
 
 
@@ -368,6 +369,7 @@ def scan():
                         "size": entry.stat().st_size,
                         "status": "pending",
                         "destination": None,
+                        "broken": False,  # set True once every read strategy has been tried and failed
                     })
 
     videos.sort(key=lambda v: v["filename"].lower())
@@ -504,8 +506,8 @@ def grab_frame(path, ratio):
 
 def make_placeholder_frame(width=640, height=360):
     """A small dark 'preview unavailable' frame, used for the rare video that
-    fails every seek strategy, so the slideshow shows something clean instead
-    of a broken image and can still move on."""
+    fails every seek strategy AND the sequential fallback, so the slideshow
+    shows something clean instead of a broken image and can still move on."""
     frame = np.full((height, width, 3), 24, dtype=np.uint8)
     text = "Preview unavailable"
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -516,8 +518,129 @@ def make_placeholder_frame(width=640, height=360):
     return frame
 
 
+def _encode_and_cache(path, mtime, idx, num_snapshots, frame):
+    """Resize, JPEG-encode, and write one frame to its cache slot. Returns
+    True if it wrote (or already had) a cache file for this idx."""
+    cache_key = hashlib.sha1(f"{path}|{mtime}|{idx}|{num_snapshots}".encode()).hexdigest()
+    cache_file = CACHE_DIR / f"{cache_key}.jpg"
+    if cache_file.exists():
+        return True
+    h, w = frame.shape[:2]
+    max_w = 640
+    if w > max_w:
+        scale = max_w / w
+        frame = cv2.resize(frame, (max_w, int(h * scale)))
+    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 82])
+    if not ok:
+        return False
+    cache_file.write_bytes(buf.tobytes())
+    return True
+
+
+COUNT_TIMEOUT_SECONDS = 30
+
+
+def _count_frames_sequential(path, safety_cap=500000):
+    """Fast real frame count via grab() only (skips the decode/color-convert
+    that read() does) — used when the container's own metadata
+    (CAP_PROP_FRAME_COUNT) is missing or zero, which is common on exactly
+    the broken-seek-index files this whole fallback exists for."""
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return 0
+    count = 0
+    try:
+        while count <= safety_cap:
+            if not cap.grab():
+                break
+            count += 1
+    except Exception:
+        pass
+    finally:
+        cap.release()
+    return count
+
+
+def _sequential_batch_fill(video, num_snapshots, want_idx):
+    """Last-resort fallback for files where every *seek* fails or times out
+    (broken keyframe index, odd VFR footage, etc.) — the "packet read max
+    attempts exceeded" case. cv2's seek-based reads keep failing on these
+    because seeking is what's broken, not decoding: the file plays back just
+    fine start-to-finish (which is why it works in VLC). So instead of
+    seeking, this opens the file once and reads forward from frame 0,
+    grabbing every snapshot frame as playback passes its target position —
+    exactly what a normal player does. One linear pass fills in every
+    snapshot for the video at once, so this expensive path only ever runs
+    once per problem video, not once per thumbnail.
+    Returns True if it managed to produce (and cache) at least `want_idx`.
+    """
+    path = video["path"]
+    frame_count, _fps = _probe_video(path)
+
+    if frame_count <= 0:
+        # Container metadata didn't give us a usable total (common on
+        # exactly these broken files) — count for real instead of giving up.
+        frame_count = run_with_timeout(
+            lambda: _count_frames_sequential(path), timeout=COUNT_TIMEOUT_SECONDS
+        ) or 0
+
+    if frame_count <= 0:
+        return False
+
+    targets = {
+        i: max(0, min(int(frame_count * ((i + 1) / num_snapshots)), frame_count - 1))
+        for i in range(num_snapshots)
+    }
+
+    def _decode_all():
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            return {}
+        results = {}
+        remaining = dict(targets)
+        last_frame = None
+        frame_no = 0
+        # Hard cap so a file with corrupted metadata (frame_count wildly
+        # wrong, or a stream that never signals EOF) can't scan forever.
+        max_frames_scanned = max(frame_count, 1) + 1000
+        try:
+            while remaining and frame_no <= max_frames_scanned:
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    break
+                last_frame = frame
+                hit = [i for i, t in remaining.items() if frame_no >= t]
+                for i in hit:
+                    results[i] = frame.copy()
+                    del remaining[i]
+                frame_no += 1
+        except Exception:
+            pass
+        finally:
+            cap.release()
+        # Whatever targets we never technically reached (e.g. frame_count
+        # was an overestimate) just get the last real frame we decoded,
+        # rather than being left missing.
+        if last_frame is not None:
+            for i in remaining:
+                results[i] = last_frame
+        return results
+
+    results = run_with_timeout(_decode_all, timeout=SEQUENTIAL_BATCH_TIMEOUT_SECONDS)
+    if not results:
+        return False
+
+    mtime = os.path.getmtime(path)
+    for i, frame in results.items():
+        _encode_and_cache(path, mtime, i, num_snapshots, frame)
+
+    return want_idx in results
+
+
 @app.route("/api/thumbnail/<vid>/<int:idx>")
 def thumbnail(vid, idx):
+    from flask import Response
+
     with state_lock:
         video = find_video(vid)
         num_snapshots = state["num_snapshots"]
@@ -529,6 +652,13 @@ def thumbnail(vid, idx):
     if not os.path.isfile(video["path"]):
         return "", 404
 
+    # Already established this file can't be read by any strategy we have —
+    # don't burn time (or spam warnings) retrying it on every single
+    # thumbnail index. Just hand back the placeholder immediately.
+    if video.get("broken"):
+        ok, buf = cv2.imencode(".jpg", make_placeholder_frame(), [cv2.IMWRITE_JPEG_QUALITY, 82])
+        return Response(buf.tobytes(), mimetype="image/jpeg") if ok else ("", 500)
+
     mtime = os.path.getmtime(video["path"])
     cache_key = hashlib.sha1(f"{video['path']}|{mtime}|{idx}|{num_snapshots}".encode()).hexdigest()
     cache_file = CACHE_DIR / f"{cache_key}.jpg"
@@ -539,35 +669,56 @@ def thumbnail(vid, idx):
     ratio = (idx + 1) / num_snapshots  # e.g. 5%, 10%, ... 100% for 20 snapshots
 
     # Only one thread may decode this particular file at a time (see
-    # _get_video_lock) — this is what actually fixes the corruption/hang,
-    # not just the timeout below. The timeout still matters as a backstop
-    # for a single genuinely broken read.
+    # _get_video_lock) — this is what actually fixes the corruption/hang
+    # from concurrent decodes, and also means only one thread will ever
+    # trigger the sequential fallback below for a given video.
     with _get_video_lock(video["path"]):
+        # Another thread may have just filled the cache (via the sequential
+        # fallback) while we were waiting for the lock.
+        if cache_file.exists():
+            return send_file(cache_file, mimetype="image/jpeg", max_age=3600)
+
         frame = run_with_timeout(lambda: grab_frame(video["path"], ratio))
-    timed_out_or_failed = frame is None
-    if frame is None:
-        frame = make_placeholder_frame()
 
-    h, w = frame.shape[:2]
-    max_w = 640
-    if w > max_w:
-        scale = max_w / w
-        frame = cv2.resize(frame, (max_w, int(h * scale)))
+        if frame is None:
+            # Seeking is unreliable for this file — fall back to one
+            # sequential decode pass that fills in every snapshot at once.
+            if _sequential_batch_fill(video, num_snapshots, idx) and cache_file.exists():
+                return send_file(cache_file, mimetype="image/jpeg", max_age=3600)
 
-    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 82])
-    if not ok:
-        return "", 500
+        timed_out_or_failed = frame is None
+        if frame is None:
+            # Both the fast seek-based path AND the full sequential decode
+            # (which counts real frames itself when metadata is bad) failed
+            # to produce anything at all for this file. That's not a
+            # transient hiccup — this file genuinely can't be read by any
+            # strategy we have, so mark it and stop retrying it.
+            with state_lock:
+                v = find_video(vid)
+                if v:
+                    v["broken"] = True
+            frame = make_placeholder_frame()
 
-    jpeg_bytes = buf.tobytes()
+        h, w = frame.shape[:2]
+        max_w = 640
+        if w > max_w:
+            scale = max_w / w
+            frame = cv2.resize(frame, (max_w, int(h * scale)))
 
-    if timed_out_or_failed:
-        # Don't cache the placeholder: a video that timed out this time may
-        # still succeed on a later request, so don't lock in the failure.
-        from flask import Response
-        return Response(jpeg_bytes, mimetype="image/jpeg")
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 82])
+        if not ok:
+            return "", 500
 
-    cache_file.write_bytes(jpeg_bytes)
-    return send_file(cache_file, mimetype="image/jpeg", max_age=3600)
+        jpeg_bytes = buf.tobytes()
+
+        if timed_out_or_failed:
+            # Don't cache the placeholder: a video that timed out this time
+            # may still succeed on a later request, so don't lock in the
+            # failure.
+            return Response(jpeg_bytes, mimetype="image/jpeg")
+
+        cache_file.write_bytes(jpeg_bytes)
+        return send_file(cache_file, mimetype="image/jpeg", max_age=3600)
 
 
 @app.route("/api/action", methods=["POST"])
@@ -597,6 +748,14 @@ def action():
                 # Just move past it — no file operation at all. Used as the
                 # escape hatch for a video that's hanging or won't preview.
                 video["status"] = "skipped"
+
+            elif act == "auto_skip":
+                # Same as skip (no file operation) but only ever sent by the
+                # frontend after the backend has already marked this file
+                # unreadable — kept as a distinct status so it shows up in
+                # its own "couldn't be read" list instead of blending in
+                # with videos the person chose to skip themselves.
+                video["status"] = "auto_skipped"
 
             else:
                 button = next((b for b in settings["sort_buttons"] if b["id"] == act), None)

@@ -386,6 +386,7 @@ kbd {
 .badge.kept { background: rgba(95,185,139,0.18); color: var(--success); }
 .badge.moved { background: rgba(92,159,224,0.18); color: var(--info); }
 .badge.skipped { background: rgba(139,147,163,0.18); color: var(--text-dim); }
+.badge.auto_skipped { background: rgba(224,100,92,0.12); color: var(--danger); }
 
 #skip-btn { width: 100%; max-width: 900px; }
 

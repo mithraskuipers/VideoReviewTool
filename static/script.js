@@ -56,6 +56,8 @@ const framePercentEl = document.getElementById('frame-percent');
 const currentFilename = document.getElementById('current-filename');
 const currentFilemeta = document.getElementById('current-filemeta');
 const queueList = document.getElementById('queue-list');
+const unreadablePanel = document.getElementById('unreadable-panel');
+const unreadableList = document.getElementById('unreadable-list');
 const doneSummary = document.getElementById('done-summary');
 
 let scannedVideos = [];
@@ -66,6 +68,8 @@ let currentImages = null; // the preloaded Image() array for the video currently
 let busy = false; // guard against double key-presses while an action is in flight
 let loadToken = 0; // bumped every time loadPreview() starts, so late-arriving image
                     // loads for a video the user already skipped/actioned past are ignored
+let brokenPollTimer = null; // polls while a video is loading to catch the backend
+                             // flagging it unreadable, so we can auto-skip quickly
 
 const DEFAULT_SETTINGS = {
   delete_key: 'd',
@@ -456,6 +460,7 @@ function renderLegend(settings) {
   let html = `<li><kbd>${escapeHtml(settings.delete_key.toUpperCase())}</kbd><span>Delete file <em>(sent to Recycle Bin / Trash)</em></span></li>`;
   html += `<li><kbd>${escapeHtml(settings.keep_key.toUpperCase())}</kbd><span>Keep <em>(leave in place, no changes)</em></span></li>`;
   html += `<li><kbd>Esc</kbd><span>Skip <em>(move on, no changes — for stuck/broken videos)</em></span></li>`;
+  html += `<li><span style="width:26px;text-align:center;color:var(--text-dim);font-size:11px;">auto</span><span>Unreadable files are skipped automatically <em>(listed below)</em></span></li>`;
   settings.sort_buttons.forEach(b => {
     html += `<li><kbd>${escapeHtml(b.key.toUpperCase())}</kbd><span>Move to subfolder <b>/${escapeHtml(b.folder)}</b></span></li>`;
   });
@@ -531,6 +536,7 @@ restartBtn.addEventListener('click', () => location.reload());
 
 stopBtn.addEventListener('click', async () => {
   stopSlideshow();
+  stopBrokenPoll();
   stopBtn.disabled = true;
   try {
     await fetch('/api/stop', { method: 'POST' });
@@ -568,6 +574,7 @@ async function refreshStatus() {
     }
   }
   renderQueue(data);
+  renderUnreadable(data);
   renderProgress(data);
 
   if (data.total > 0 && data.current_index >= data.total) {
@@ -593,7 +600,7 @@ function renderQueue(data) {
   queueList.innerHTML = data.videos.map((v, i) => {
     const active = i === data.current_index ? 'active' : '';
     const badgeText = v.status === 'moved' ? `→ ${v.destination}` :
-      { pending: 'PENDING', deleted: 'DELETED', kept: 'KEPT', skipped: 'SKIPPED' }[v.status] || v.status.toUpperCase();
+      { pending: 'PENDING', deleted: 'DELETED', kept: 'KEPT', skipped: 'SKIPPED', auto_skipped: 'UNREADABLE' }[v.status] || v.status.toUpperCase();
     return `<li class="${active}">
       <span class="badge ${v.status}">${escapeHtml(badgeText)}</span>
       <span class="fname">${escapeHtml(v.filename)}</span>
@@ -601,8 +608,21 @@ function renderQueue(data) {
   }).join('');
 }
 
+function renderUnreadable(data) {
+  const broken = data.videos.filter(v => v.status === 'auto_skipped');
+  if (broken.length === 0) {
+    unreadablePanel.classList.add('hidden');
+    return;
+  }
+  unreadablePanel.classList.remove('hidden');
+  unreadableList.innerHTML = broken.map(v =>
+    `<li><span class="fname">${escapeHtml(v.filename)}</span></li>`
+  ).join('');
+}
+
 function loadPreview(video) {
   stopSlideshow();
+  stopBrokenPoll();
   currentImages = null;
   frameScrubber.disabled = true;
   previewLoading.classList.remove('hidden');
@@ -631,9 +651,37 @@ function loadPreview(video) {
     img.src = url;
     images[i] = img;
   });
+
+  startBrokenPoll(video, myToken);
+}
+
+/* While a preview is loading, periodically check whether the backend has
+   flagged this file as unreadable (every seek strategy AND the full
+   sequential decode fallback failed on it) and, if so, skip it
+   automatically instead of leaving the person staring at a stuck loader. */
+function startBrokenPoll(video, myToken) {
+  brokenPollTimer = setInterval(async () => {
+    if (myToken !== loadToken) { stopBrokenPoll(); return; }
+    try {
+      const res = await fetch('/api/status');
+      const data = await res.json();
+      const v = data.videos.find(x => x.id === video.id);
+      if (v && v.broken && v.status === 'pending' && myToken === loadToken) {
+        stopBrokenPoll();
+        await performAction('auto_skip');
+      }
+    } catch (e) {
+      // non-critical — worst case the person can still hit Skip manually
+    }
+  }, 1500);
+}
+
+function stopBrokenPoll() {
+  if (brokenPollTimer) { clearInterval(brokenPollTimer); brokenPollTimer = null; }
 }
 
 function startSlideshow(images, startIdx = 0) {
+  stopBrokenPoll(); // it loaded fine — no need to keep checking for 'broken'
   previewLoading.classList.add('hidden');
   currentImages = images;
   slideshowIdx = startIdx;
@@ -681,6 +729,7 @@ frameScrubber.addEventListener('change', () => {
 
 function showDone(data) {
   stopSlideshow();
+  stopBrokenPoll();
   reviewScreen.classList.add('hidden');
   doneScreen.classList.remove('hidden');
   const counts = {};
@@ -704,6 +753,7 @@ async function performAction(act) {
     const data = await res.json();
     if (data.success) {
       stopSlideshow();
+      stopBrokenPoll();
       currentImages = null;
       loadToken++; // invalidate any in-flight thumbnail loads for the video we just left
       currentVideo = null; // force next video to load
