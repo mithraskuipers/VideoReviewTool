@@ -64,6 +64,28 @@
         </div>
       </div>
 
+      <div class="prepare-box">
+        <button id="prepare-btn" class="btn btn-secondary btn-block">⚡ Prepare snapshots for this folder</button>
+        <p class="dropzone-hint" style="margin:6px 0 0;">
+          Optional. Pre-generates and caches every snapshot for every video in the folder above,
+          using the snapshot count set above. Makes reviewing near-instant afterwards — especially
+          worthwhile on a slow network — but takes a while up front for large folders. You can also
+          run this from the command line: <code>python app.py --prepare "path\to\folder"</code>.
+        </p>
+      </div>
+
+      <div id="prepare-progress" class="settings-editor hidden">
+        <div class="settings-row settings-row-fixed">
+          <span class="settings-row-label" id="prepare-status-label" style="min-width:0; flex:1;">Preparing…</span>
+          <button id="prepare-cancel-btn" class="btn btn-secondary btn-small">Cancel</button>
+        </div>
+        <div class="progress-track">
+          <div id="prepare-progress-fill" class="progress-fill" style="width:0%"></div>
+        </div>
+        <p id="prepare-current-file" class="footnote" style="margin:0; text-align:left;"></p>
+        <p id="prepare-message" class="message"></p>
+      </div>
+
       <button id="toggle-settings-btn" class="btn btn-secondary btn-block">⚙ Customize buttons &amp; folders</button>
 
       <div id="settings-editor" class="settings-editor hidden">
@@ -186,6 +208,24 @@
         </div>
 
         <div class="panel">
+          <h3>Prepare another folder</h3>
+          <p class="settings-row-desc" style="margin:0 0 10px;">Pre-cache snapshots for a different folder in the background while you keep reviewing this one.</p>
+          <input type="text" id="review-prepare-path" class="folder-input" style="width:100%; margin-bottom:8px;" placeholder="Folder path to prepare next">
+          <button id="review-prepare-btn" class="btn btn-secondary btn-block btn-small">⚡ Prepare snapshots</button>
+          <div id="review-prepare-progress" class="settings-editor hidden" style="margin-top:10px;">
+            <div class="settings-row settings-row-fixed">
+              <span class="settings-row-label" id="review-prepare-status-label" style="min-width:0; flex:1;">Preparing…</span>
+              <button id="review-prepare-cancel-btn" class="btn btn-secondary btn-small">Cancel</button>
+            </div>
+            <div class="progress-track">
+              <div id="review-prepare-progress-fill" class="progress-fill" style="width:0%"></div>
+            </div>
+            <p id="review-prepare-current-file" class="footnote" style="margin:0; text-align:left;"></p>
+            <p id="review-prepare-message" class="message"></p>
+          </div>
+        </div>
+
+        <div class="panel">
           <h3>Controls</h3>
           <ul id="key-legend" class="key-legend"></ul>
         </div>
@@ -211,6 +251,26 @@
       <h1>All videos processed</h1>
       <p class="subtitle" id="done-summary"></p>
       <button id="restart-btn" class="btn btn-primary">Review another folder</button>
+
+      <div class="prepare-box" style="text-align:left; margin-top:26px; padding-top:22px; border-top:1px solid var(--border);">
+        <p class="dropzone-title" style="margin:0 0 8px;">Prepare the next folder</p>
+        <p class="dropzone-hint" style="margin:0 0 12px;">Pre-cache its snapshots now so reviewing it later is instant.</p>
+        <div class="path-row">
+          <input id="done-prepare-path" type="text" placeholder="Folder path to prepare next" />
+          <button id="done-prepare-btn" class="btn btn-secondary">⚡ Prepare</button>
+        </div>
+        <div id="done-prepare-progress" class="settings-editor hidden">
+          <div class="settings-row settings-row-fixed">
+            <span class="settings-row-label" id="done-prepare-status-label" style="min-width:0; flex:1;">Preparing…</span>
+            <button id="done-prepare-cancel-btn" class="btn btn-secondary btn-small">Cancel</button>
+          </div>
+          <div class="progress-track">
+            <div id="done-prepare-progress-fill" class="progress-fill" style="width:0%"></div>
+          </div>
+          <p id="done-prepare-current-file" class="footnote" style="margin:0; text-align:left;"></p>
+          <p id="done-prepare-message" class="message"></p>
+        </div>
+      </div>
     </div>
   </section>
 

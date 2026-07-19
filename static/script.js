@@ -21,6 +21,50 @@ const snapshotCountInput = document.getElementById('snapshot-count');
 const snapshotIntervalLabel = document.getElementById('snapshot-interval');
 const frameTotalEl = document.getElementById('frame-total');
 
+// Prepare mode exists in three places (setup screen, review-screen sidebar,
+// done screen) that all drive the same single background job on the
+// backend. Each entry below is one panel's DOM refs; wirePreparePanel()
+// binds its button/cancel button, and every poll tick updates all three
+// panels together (see renderPrepareStatus/onPrepareFinished) so whichever
+// screen you're looking at always reflects the current job, regardless of
+// which panel actually started it.
+const preparePanels = [
+  {
+    idleLabel: '⚡ Prepare snapshots for this folder',
+    pathInput: document.getElementById('path-input'),
+    btn: document.getElementById('prepare-btn'),
+    progress: document.getElementById('prepare-progress'),
+    statusLabel: document.getElementById('prepare-status-label'),
+    fill: document.getElementById('prepare-progress-fill'),
+    currentFile: document.getElementById('prepare-current-file'),
+    message: document.getElementById('prepare-message'),
+    cancelBtn: document.getElementById('prepare-cancel-btn'),
+  },
+  {
+    idleLabel: '⚡ Prepare snapshots',
+    pathInput: document.getElementById('review-prepare-path'),
+    btn: document.getElementById('review-prepare-btn'),
+    progress: document.getElementById('review-prepare-progress'),
+    statusLabel: document.getElementById('review-prepare-status-label'),
+    fill: document.getElementById('review-prepare-progress-fill'),
+    currentFile: document.getElementById('review-prepare-current-file'),
+    message: document.getElementById('review-prepare-message'),
+    cancelBtn: document.getElementById('review-prepare-cancel-btn'),
+  },
+  {
+    idleLabel: '⚡ Prepare',
+    pathInput: document.getElementById('done-prepare-path'),
+    btn: document.getElementById('done-prepare-btn'),
+    progress: document.getElementById('done-prepare-progress'),
+    statusLabel: document.getElementById('done-prepare-status-label'),
+    fill: document.getElementById('done-prepare-progress-fill'),
+    currentFile: document.getElementById('done-prepare-current-file'),
+    message: document.getElementById('done-prepare-message'),
+    cancelBtn: document.getElementById('done-prepare-cancel-btn'),
+  },
+];
+let preparePollTimer = null;
+
 const speedPreset = document.getElementById('speed-preset');
 const speedCountInput = document.getElementById('speed-count');
 const speedLabel = document.getElementById('speed-label');
@@ -524,6 +568,132 @@ function escapeHtml(s) {
   const d = document.createElement('div');
   d.textContent = s;
   return d.innerHTML;
+}
+
+/* ---------------- Prepare mode: pre-cache snapshots ahead of time ---------------- */
+
+function getPreferredNumSnapshots() {
+  // The setup screen's field is always present in the DOM (even when that
+  // screen is hidden) and is kept in sync with currentSettings, so it's a
+  // reasonable single source of truth for "how many snapshots" even when
+  // prepare is kicked off from the review or done screens, which don't
+  // have their own snapshot-count picker.
+  const n = parseInt(snapshotCountInput.value, 10) ||
+    (currentSettings && currentSettings.default_num_snapshots) || NUM_SNAPSHOTS || 20;
+  return clampSnapshotCount(n);
+}
+
+function wirePreparePanel(panel) {
+  if (!panel.btn) return;
+
+  panel.btn.addEventListener('click', async () => {
+    const path = (panel.pathInput.value || '').trim();
+    if (!path) {
+      panel.message.style.color = '';
+      panel.message.textContent = 'Enter a folder path first.';
+      return;
+    }
+
+    panel.message.style.color = '';
+    panel.message.textContent = '';
+    panel.btn.disabled = true;
+    panel.btn.textContent = 'Starting…';
+
+    try {
+      const res = await fetch('/api/prepare', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path, num_snapshots: getPreferredNumSnapshots() }),
+      });
+      const data = await res.json();
+      if (!data.success) {
+        panel.message.textContent = data.error || 'Could not start preparing that folder.';
+        panel.btn.disabled = false;
+        panel.btn.textContent = panel.idleLabel;
+        return;
+      }
+      preparePanels.forEach(p => {
+        if (p.cancelBtn) p.cancelBtn.disabled = false;
+        if (p.progress) p.progress.classList.remove('hidden');
+      });
+      pollPrepareStatus();
+    } catch (e) {
+      panel.message.textContent = 'Could not reach the local server.';
+      panel.btn.disabled = false;
+      panel.btn.textContent = panel.idleLabel;
+    }
+  });
+
+  if (panel.cancelBtn) {
+    panel.cancelBtn.addEventListener('click', async () => {
+      preparePanels.forEach(p => { if (p.cancelBtn) p.cancelBtn.disabled = true; });
+      try {
+        await fetch('/api/prepare/cancel', { method: 'POST' });
+      } catch (e) {
+        preparePanels.forEach(p => { if (p.cancelBtn) p.cancelBtn.disabled = false; });
+      }
+    });
+  }
+}
+
+preparePanels.forEach(wirePreparePanel);
+
+function pollPrepareStatus() {
+  if (preparePollTimer) clearInterval(preparePollTimer);
+  preparePollTimer = setInterval(async () => {
+    try {
+      const res = await fetch('/api/prepare/status');
+      const data = await res.json();
+      renderPrepareStatus(data);
+      if (!data.running) {
+        clearInterval(preparePollTimer);
+        preparePollTimer = null;
+        onPrepareFinished(data);
+      }
+    } catch (e) {
+      // transient fetch error — keep polling rather than giving up
+    }
+  }, 700);
+}
+
+function renderPrepareStatus(data) {
+  const total = data.total_videos || 0;
+  const done = data.done_videos || 0;
+  const pct = total ? Math.round((done / total) * 100) : 0;
+  preparePanels.forEach(panel => {
+    if (!panel.fill) return;
+    panel.progress.classList.remove('hidden');
+    panel.fill.style.width = pct + '%';
+    panel.statusLabel.textContent = data.running
+      ? `Preparing… ${done} / ${total} video${total === 1 ? '' : 's'} (${pct}%)`
+      : `${done} / ${total} video${total === 1 ? '' : 's'} prepared`;
+    panel.currentFile.textContent = data.current_filename ? `Working on: ${data.current_filename}` : '';
+  });
+}
+
+function onPrepareFinished(data) {
+  preparePanels.forEach(panel => {
+    if (!panel.btn) return;
+    panel.btn.disabled = false;
+    panel.btn.textContent = panel.idleLabel;
+    if (panel.cancelBtn) panel.cancelBtn.disabled = true;
+    panel.message.style.color = '';
+
+    if (data.error) {
+      panel.message.textContent = `Prepare stopped early: ${data.error}`;
+      return;
+    }
+    if (data.cancelled) {
+      panel.message.textContent = `Cancelled — ${data.done_videos} video${data.done_videos === 1 ? '' : 's'} were already cached before stopping.`;
+      return;
+    }
+    let msg = `Done — ${data.done_videos} video${data.done_videos === 1 ? '' : 's'} ready for instant review.`;
+    if (data.unreadable && data.unreadable.length) {
+      msg += ` ${data.unreadable.length} file${data.unreadable.length === 1 ? '' : 's'} couldn't be read and will be auto-skipped during review.`;
+    }
+    panel.message.style.color = 'var(--success)';
+    panel.message.textContent = msg;
+  });
 }
 
 startBtn.addEventListener('click', () => {

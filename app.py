@@ -69,6 +69,44 @@ MAX_SLIDESHOW_MS = 3000
 CACHE_DIR = Path.home() / ".video_review_tool_cache"
 CACHE_DIR.mkdir(exist_ok=True)
 
+
+# --------------------------------------------------------------------------
+# Thumbnail cache naming.
+#
+# Cache filenames are keyed on the video's id (a stable hash of its path,
+# assigned once at scan time and never changed even if the file is later
+# moved/renamed by a sort action) plus mtime/idx/num_snapshots, rather than
+# hashing all four fields together into one opaque name. Using the video id
+# as a *prefix* means every cache file that belongs to a given video can be
+# found and removed with a single glob, regardless of which mtime or
+# snapshot-count it was generated under. That matters for two features:
+# "prepare" mode, which fills the cache ahead of time (possibly at a
+# different snapshot count than review ends up using), and post-action
+# cleanup, which needs to reliably delete everything for a video once it's
+# been processed without knowing exactly which combinations were ever
+# generated for it.
+# --------------------------------------------------------------------------
+
+def cache_filename(video_id, mtime, idx, num_snapshots):
+    mtime_key = str(mtime).replace(".", "_")
+    return f"{video_id}__{mtime_key}__{idx}__{num_snapshots}.jpg"
+
+
+def cache_path(video_id, mtime, idx, num_snapshots):
+    return CACHE_DIR / cache_filename(video_id, mtime, idx, num_snapshots)
+
+
+def cleanup_video_cache(video_id):
+    """Delete every cached snapshot image for this video, no matter which
+    mtime/snapshot-count combination produced it. Called once a video has
+    been processed (deleted/kept/moved/skipped) so the cache doesn't sit
+    around holding thumbnails for files we're already done with."""
+    for f in CACHE_DIR.glob(f"{video_id}__*.jpg"):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
 # --------------------------------------------------------------------------
 # Hard per-frame timeout.
 #
@@ -341,21 +379,19 @@ def stop():
     return jsonify({"success": True})
 
 
-@app.route("/api/scan", methods=["POST"])
-def scan():
-    data = request.get_json(force=True)
-    folder = (data.get("path") or "").strip().strip('"')
-
-    if not folder or not os.path.isdir(folder):
-        return jsonify({"success": False, "error": "That folder path could not be found."})
-
-    num_snapshots = data.get("num_snapshots", state["settings"]["default_num_snapshots"])
+def clamp_num_snapshots(value, default=DEFAULT_NUM_SNAPSHOTS):
     try:
-        num_snapshots = int(num_snapshots)
+        n = int(value)
     except (TypeError, ValueError):
-        num_snapshots = DEFAULT_NUM_SNAPSHOTS
-    num_snapshots = max(MIN_NUM_SNAPSHOTS, min(MAX_NUM_SNAPSHOTS, num_snapshots))
+        n = default
+    return max(MIN_NUM_SNAPSHOTS, min(MAX_NUM_SNAPSHOTS, n))
 
+
+def list_videos_in_folder(folder):
+    """Scan a folder for supported video files and build the same video-dict
+    shape used everywhere else (id/filename/path/size/status/...). Shared by
+    /api/scan, /api/prepare, and the --prepare CLI path so there's exactly
+    one definition of what counts as a video and how its id is derived."""
     videos = []
     with os.scandir(folder) as it:
         for entry in it:
@@ -371,8 +407,23 @@ def scan():
                         "destination": None,
                         "broken": False,  # set True once every read strategy has been tried and failed
                     })
-
     videos.sort(key=lambda v: v["filename"].lower())
+    return videos
+
+
+@app.route("/api/scan", methods=["POST"])
+def scan():
+    data = request.get_json(force=True)
+    folder = (data.get("path") or "").strip().strip('"')
+
+    if not folder or not os.path.isdir(folder):
+        return jsonify({"success": False, "error": "That folder path could not be found."})
+
+    num_snapshots = clamp_num_snapshots(
+        data.get("num_snapshots", state["settings"]["default_num_snapshots"])
+    )
+
+    videos = list_videos_in_folder(folder)
 
     with state_lock:
         state["folder"] = folder
@@ -518,11 +569,10 @@ def make_placeholder_frame(width=640, height=360):
     return frame
 
 
-def _encode_and_cache(path, mtime, idx, num_snapshots, frame):
+def _encode_and_cache(video_id, mtime, idx, num_snapshots, frame):
     """Resize, JPEG-encode, and write one frame to its cache slot. Returns
     True if it wrote (or already had) a cache file for this idx."""
-    cache_key = hashlib.sha1(f"{path}|{mtime}|{idx}|{num_snapshots}".encode()).hexdigest()
-    cache_file = CACHE_DIR / f"{cache_key}.jpg"
+    cache_file = cache_path(video_id, mtime, idx, num_snapshots)
     if cache_file.exists():
         return True
     h, w = frame.shape[:2]
@@ -632,9 +682,73 @@ def _sequential_batch_fill(video, num_snapshots, want_idx):
 
     mtime = os.path.getmtime(path)
     for i, frame in results.items():
-        _encode_and_cache(path, mtime, i, num_snapshots, frame)
+        _encode_and_cache(video["id"], mtime, i, num_snapshots, frame)
 
     return want_idx in results
+
+
+def ensure_thumbnail_cached(video, idx, num_snapshots):
+    """Make sure a cache file exists on disk for this (video, idx,
+    num_snapshots) combination, generating and writing it if it doesn't.
+
+    This is the one shared code path for "produce a thumbnail" — used both
+    by the live /api/thumbnail route (one frame at a time, as the browser
+    asks for it) and by prepare mode, which calls this for every index of
+    every video in a folder ahead of time so review never has to decode
+    anything itself.
+
+    Returns the cache Path on success. Returns None if this file couldn't
+    be read by any strategy we have (or a single attempt timed out) — the
+    caller decides what to do about it (the live route falls back to a
+    placeholder; prepare just logs it and moves on to the next video). On a
+    definitive failure this also marks the video "broken" in shared state,
+    so nobody keeps re-trying a file we already know can't be read.
+    """
+    if not os.path.isfile(video["path"]):
+        return None
+    if video.get("broken"):
+        return None
+
+    mtime = os.path.getmtime(video["path"])
+    cache_file = cache_path(video["id"], mtime, idx, num_snapshots)
+    if cache_file.exists():
+        return cache_file
+
+    ratio = (idx + 1) / num_snapshots  # e.g. 5%, 10%, ... 100% for 20 snapshots
+
+    # Only one thread may decode this particular file at a time (see
+    # _get_video_lock) — this is what actually fixes the corruption/hang
+    # from concurrent decodes, and also means only one thread will ever
+    # trigger the sequential fallback below for a given video.
+    with _get_video_lock(video["path"]):
+        # Another thread may have just filled the cache (via the sequential
+        # fallback) while we were waiting for the lock.
+        if cache_file.exists():
+            return cache_file
+
+        frame = run_with_timeout(lambda: grab_frame(video["path"], ratio))
+
+        if frame is None:
+            # Seeking is unreliable for this file — fall back to one
+            # sequential decode pass that fills in every snapshot at once.
+            if _sequential_batch_fill(video, num_snapshots, idx) and cache_file.exists():
+                return cache_file
+
+        if frame is None:
+            # Both the fast seek-based path AND the full sequential decode
+            # (which counts real frames itself when metadata is bad) failed
+            # to produce anything at all for this file. That's not a
+            # transient hiccup — this file genuinely can't be read by any
+            # strategy we have, so mark it and stop retrying it.
+            with state_lock:
+                v = find_video(video["id"])
+                if v:
+                    v["broken"] = True
+            return None
+
+        if _encode_and_cache(video["id"], mtime, idx, num_snapshots, frame):
+            return cache_file
+        return None
 
 
 @app.route("/api/thumbnail/<vid>/<int:idx>")
@@ -659,66 +773,16 @@ def thumbnail(vid, idx):
         ok, buf = cv2.imencode(".jpg", make_placeholder_frame(), [cv2.IMWRITE_JPEG_QUALITY, 82])
         return Response(buf.tobytes(), mimetype="image/jpeg") if ok else ("", 500)
 
-    mtime = os.path.getmtime(video["path"])
-    cache_key = hashlib.sha1(f"{video['path']}|{mtime}|{idx}|{num_snapshots}".encode()).hexdigest()
-    cache_file = CACHE_DIR / f"{cache_key}.jpg"
-
-    if cache_file.exists():
+    cache_file = ensure_thumbnail_cached(video, idx, num_snapshots)
+    if cache_file is not None:
         return send_file(cache_file, mimetype="image/jpeg", max_age=3600)
 
-    ratio = (idx + 1) / num_snapshots  # e.g. 5%, 10%, ... 100% for 20 snapshots
-
-    # Only one thread may decode this particular file at a time (see
-    # _get_video_lock) — this is what actually fixes the corruption/hang
-    # from concurrent decodes, and also means only one thread will ever
-    # trigger the sequential fallback below for a given video.
-    with _get_video_lock(video["path"]):
-        # Another thread may have just filled the cache (via the sequential
-        # fallback) while we were waiting for the lock.
-        if cache_file.exists():
-            return send_file(cache_file, mimetype="image/jpeg", max_age=3600)
-
-        frame = run_with_timeout(lambda: grab_frame(video["path"], ratio))
-
-        if frame is None:
-            # Seeking is unreliable for this file — fall back to one
-            # sequential decode pass that fills in every snapshot at once.
-            if _sequential_batch_fill(video, num_snapshots, idx) and cache_file.exists():
-                return send_file(cache_file, mimetype="image/jpeg", max_age=3600)
-
-        timed_out_or_failed = frame is None
-        if frame is None:
-            # Both the fast seek-based path AND the full sequential decode
-            # (which counts real frames itself when metadata is bad) failed
-            # to produce anything at all for this file. That's not a
-            # transient hiccup — this file genuinely can't be read by any
-            # strategy we have, so mark it and stop retrying it.
-            with state_lock:
-                v = find_video(vid)
-                if v:
-                    v["broken"] = True
-            frame = make_placeholder_frame()
-
-        h, w = frame.shape[:2]
-        max_w = 640
-        if w > max_w:
-            scale = max_w / w
-            frame = cv2.resize(frame, (max_w, int(h * scale)))
-
-        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 82])
-        if not ok:
-            return "", 500
-
-        jpeg_bytes = buf.tobytes()
-
-        if timed_out_or_failed:
-            # Don't cache the placeholder: a video that timed out this time
-            # may still succeed on a later request, so don't lock in the
-            # failure.
-            return Response(jpeg_bytes, mimetype="image/jpeg")
-
-        cache_file.write_bytes(jpeg_bytes)
-        return send_file(cache_file, mimetype="image/jpeg", max_age=3600)
+    # Couldn't produce this frame just now — either it was just marked
+    # broken above, or a single attempt timed out transiently. Either way,
+    # hand back a placeholder without caching it, so a transient failure
+    # still gets a fresh chance on the next request.
+    ok, buf = cv2.imencode(".jpg", make_placeholder_frame(), [cv2.IMWRITE_JPEG_QUALITY, 82])
+    return Response(buf.tobytes(), mimetype="image/jpeg") if ok else ("", 500)
 
 
 @app.route("/api/action", methods=["POST"])
@@ -779,10 +843,186 @@ def action():
 
         state["current_index"] += 1
 
+    # Done with this video one way or another — its cached snapshot images
+    # (whether generated live during review, or ahead of time by prepare
+    # mode) are no longer needed, regardless of which snapshot count(s)
+    # they were generated at.
+    cleanup_video_cache(video["id"])
+
     return jsonify({"success": True})
 
 
+# --------------------------------------------------------------------------
+# Prepare mode.
+#
+# Reviewing a folder over a slow network means every thumbnail has to be
+# decoded on the machine running the server (often the NAS/remote box) and
+# then streamed to the browser, one frame at a time, right as the person
+# scrubs to it — normally hidden behind the "loading previews" spinner for
+# each video. Prepare mode does that same decoding work ahead of time for
+# an entire folder, so a later review session finds every thumbnail already
+# sitting in the cache and never waits on a decode. It's just the existing
+# ensure_thumbnail_cached() pipeline, run for every index of every video in
+# a folder up front, in a background thread so the request that kicks it
+# off can return immediately and the setup screen can poll for progress.
+# --------------------------------------------------------------------------
+
+_prepare_lock = threading.Lock()
+_prepare_state = {
+    "running": False,
+    "folder": None,
+    "num_snapshots": None,
+    "total_videos": 0,
+    "done_videos": 0,
+    "current_filename": None,
+    "unreadable": [],   # filenames that couldn't be read by any strategy
+    "cancelled": False,
+    "error": None,
+    "finished": False,  # set once a run completes (or is cancelled), cleared on the next start
+}
+
+
+def _prepare_worker(num_snapshots, videos):
+    try:
+        for video in videos:
+            with _prepare_lock:
+                if _prepare_state["cancelled"]:
+                    break
+                _prepare_state["current_filename"] = video["filename"]
+
+            if os.path.isfile(video["path"]):
+                for idx in range(num_snapshots):
+                    with _prepare_lock:
+                        if _prepare_state["cancelled"]:
+                            break
+                    if ensure_thumbnail_cached(video, idx, num_snapshots) is None:
+                        # This video can't be read by any strategy we have —
+                        # no point burning time on its remaining indices too.
+                        with _prepare_lock:
+                            _prepare_state["unreadable"].append(video["filename"])
+                        break
+
+            with _prepare_lock:
+                _prepare_state["done_videos"] += 1
+    except Exception as e:
+        with _prepare_lock:
+            _prepare_state["error"] = str(e)
+    finally:
+        with _prepare_lock:
+            _prepare_state["running"] = False
+            _prepare_state["finished"] = True
+            _prepare_state["current_filename"] = None
+
+
+@app.route("/api/prepare", methods=["POST"])
+def start_prepare():
+    data = request.get_json(force=True)
+    folder = (data.get("path") or "").strip().strip('"')
+
+    if not folder or not os.path.isdir(folder):
+        return jsonify({"success": False, "error": "That folder path could not be found."})
+
+    with _prepare_lock:
+        if _prepare_state["running"]:
+            return jsonify({"success": False, "error": "A prepare job is already running."})
+
+    num_snapshots = clamp_num_snapshots(
+        data.get("num_snapshots", state["settings"]["default_num_snapshots"])
+    )
+
+    videos = list_videos_in_folder(folder)
+    if not videos:
+        return jsonify({"success": False, "error": "No supported video files were found in that folder."})
+
+    with _prepare_lock:
+        _prepare_state.update({
+            "running": True,
+            "folder": folder,
+            "num_snapshots": num_snapshots,
+            "total_videos": len(videos),
+            "done_videos": 0,
+            "current_filename": None,
+            "unreadable": [],
+            "cancelled": False,
+            "error": None,
+            "finished": False,
+        })
+
+    threading.Thread(target=_prepare_worker, args=(num_snapshots, videos), daemon=True).start()
+
+    return jsonify({"success": True, "total": len(videos), "num_snapshots": num_snapshots})
+
+
+@app.route("/api/prepare/status")
+def prepare_status():
+    with _prepare_lock:
+        return jsonify({"success": True, **_prepare_state})
+
+
+@app.route("/api/prepare/cancel", methods=["POST"])
+def prepare_cancel():
+    with _prepare_lock:
+        if not _prepare_state["running"]:
+            return jsonify({"success": False, "error": "No prepare job is running."})
+        _prepare_state["cancelled"] = True
+    return jsonify({"success": True})
+
+
+def run_prepare_cli(folder, num_snapshots):
+    """Synchronous, print-as-it-goes version of prepare mode for the
+    command line: `python app.py --prepare <folder> [--snapshots N]`."""
+    folder = os.path.abspath(folder)
+    if not os.path.isdir(folder):
+        print(f"Folder not found: {folder}")
+        raise SystemExit(1)
+
+    num_snapshots = clamp_num_snapshots(num_snapshots)
+    videos = list_videos_in_folder(folder)
+    if not videos:
+        print(f"No supported video files were found in: {folder}")
+        raise SystemExit(1)
+
+    print(f"Preparing {len(videos)} video(s) in {folder} at {num_snapshots} snapshots each...")
+    unreadable = []
+    for i, video in enumerate(videos, start=1):
+        print(f"  [{i}/{len(videos)}] {video['filename']}", end="", flush=True)
+        ok_count = 0
+        if os.path.isfile(video["path"]):
+            for idx in range(num_snapshots):
+                if ensure_thumbnail_cached(video, idx, num_snapshots) is None:
+                    unreadable.append(video["filename"])
+                    break
+                ok_count += 1
+        status = "done" if ok_count == num_snapshots else f"stopped early ({ok_count}/{num_snapshots} — unreadable)"
+        print(f" — {status}")
+
+    print(f"\nPrepared {len(videos) - len(unreadable)}/{len(videos)} video(s).")
+    if unreadable:
+        print(f"{len(unreadable)} file(s) could not be read and were skipped:")
+        for name in unreadable:
+            print(f"  - {name}")
+    print("\nYou can now run the tool normally (python app.py / start.sh / start.bat) and "
+          "reviewing this folder will load instantly from the cache.")
+
+
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="VideoReviewTool")
+    parser.add_argument("--prepare", metavar="FOLDER",
+                         help="Pre-generate and cache snapshot thumbnails for every video in "
+                              "FOLDER, then exit without starting the web server. Useful for "
+                              "priming the cache ahead of time over a slow network.")
+    parser.add_argument("--snapshots", type=int, default=None,
+                         help="Number of snapshots per video for --prepare "
+                              f"(default: the saved setting, currently {state['settings']['default_num_snapshots']}).")
+    args = parser.parse_args()
+
+    if args.prepare:
+        run_prepare_cli(args.prepare, args.snapshots if args.snapshots is not None
+                         else state["settings"]["default_num_snapshots"])
+        raise SystemExit(0)
+
     PORT = 5000
     url = f"http://127.0.0.1:{PORT}"
     threading.Timer(1.2, lambda: webbrowser.open(url)).start()
