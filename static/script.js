@@ -20,6 +20,7 @@ const dropzone = document.getElementById('dropzone');
 const browseFolderBtn = document.getElementById('browse-folder-btn');
 const browseFileBtn = document.getElementById('browse-file-btn');
 const pathInput = document.getElementById('path-input');
+const recursiveCheckbox = document.getElementById('recursive-checkbox');
 const introMessage = document.getElementById('intro-message');
 const introNextBtn = document.getElementById('intro-next-btn');
 
@@ -330,7 +331,9 @@ async function goToModeScreen() {
   if (!ok) return;
 
   modeMessage.textContent = '';
-  modeLocation.textContent = scanFolder || pathInput.value.trim();
+  modeLocation.textContent = scanRecursive
+    ? `${scanFolder || pathInput.value.trim()} (including subfolders)`
+    : (scanFolder || pathInput.value.trim());
   if (scannedVideos.length === 1) {
     modeHeading.textContent = '1 video selected';
   } else {
@@ -697,6 +700,7 @@ function buildKeyActionMap(settings) {
 loadSettings();
 
 let scanFolder = null; // the resolved base folder returned by /api/scan (parent dir for a single file)
+let scanRecursive = false; // whether the current scan included subfolders — reused by batch compile
 
 async function doScan(path) {
   path = (path || '').trim();
@@ -707,12 +711,13 @@ async function doScan(path) {
   introMessage.textContent = '';
 
   const numSnapshots = clampSnapshotCount(parseInt(snapshotCountInput.value, 10) || 20);
+  const recursive = !!(recursiveCheckbox && recursiveCheckbox.checked);
 
   try {
     const res = await fetch('/api/scan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path, num_snapshots: numSnapshots }),
+      body: JSON.stringify({ path, num_snapshots: numSnapshots, recursive }),
     });
     const data = await res.json();
     if (!data.success) {
@@ -727,6 +732,7 @@ async function doScan(path) {
     }
     scannedVideos = data.videos;
     scanFolder = data.folder || null;
+    scanRecursive = recursive;
     if (data.count === 0) {
       introMessage.textContent = 'No supported video files were found there.';
       return false;
@@ -1054,6 +1060,7 @@ if (compileStartBtn) {
           num_shots: getCompilationShots(),
           excluded_ids: getExcludedIdsForBatch(),
           output_dir: (compileOutputInput.value || '').trim(),
+          recursive: scanRecursive,
         }),
       });
       const data = await res.json();

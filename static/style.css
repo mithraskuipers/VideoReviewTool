@@ -75,6 +75,14 @@ h1 { margin: 0 0 4px; font-size: 22px; letter-spacing: -0.01em; }
 
 .intro-lead { margin: 0 0 22px; color: var(--text-dim); font-size: 13.5px; line-height: 1.6; }
 
+.recursive-toggle {
+  display: flex; align-items: center; gap: 8px;
+  margin: 0 0 14px;
+  font-size: 13px; color: var(--text-dim);
+  cursor: pointer;
+}
+.recursive-toggle input[type="checkbox"] { accent-color: var(--accent); cursor: pointer; }
+
 .step-actions { display: flex; gap: 10px; margin-top: 18px; }
 .step-actions .btn-large { flex: 1; margin-top: 0; width: auto; }
 .step-actions .btn-secondary { flex: 0 0 auto; }

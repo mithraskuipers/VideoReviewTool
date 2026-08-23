@@ -588,29 +588,56 @@ def exclude_videos():
     return jsonify({"success": True, "count": count, "videos": videos})
 
 
-def list_videos_in_folder(folder):
+def list_videos_in_folder(folder, recursive=False):
     """Scan a folder for supported video files and build the same video-dict
     shape used everywhere else (id/filename/path/size/status/...). Shared by
     /api/scan, /api/prepare, and the --prepare CLI path so there's exactly
-    one definition of what counts as a video and how its id is derived."""
+    one definition of what counts as a video and how its id is derived.
+
+    With `recursive=True`, subdirectories are walked too — except this
+    tool's own hidden cache/trash directories, which must always be
+    skipped or a held (undoable) delete sitting in the trash dir would be
+    picked back up as a fresh pending video on the next scan."""
     cache_dir = str(get_cache_dir(folder))
     videos = []
-    with os.scandir(folder) as it:
-        for entry in it:
-            if entry.is_file():
-                ext = os.path.splitext(entry.name)[1].lower()
+
+    if recursive:
+        skip_dirnames = {CACHE_DIRNAME, TRASH_DIRNAME}
+        for root, dirnames, filenames in os.walk(folder):
+            dirnames[:] = [d for d in dirnames if d not in skip_dirnames]
+            for name in filenames:
+                ext = os.path.splitext(name)[1].lower()
                 if ext in VIDEO_EXTENSIONS:
+                    full_path = os.path.join(root, name)
                     videos.append({
-                        "id": make_id(entry.path),
-                        "filename": entry.name,
-                        "path": entry.path,
-                        "size": entry.stat().st_size,
+                        "id": make_id(full_path),
+                        "filename": name,
+                        "path": full_path,
+                        "size": os.path.getsize(full_path),
                         "status": "pending",
                         "destination": None,
-                        "broken": False,  # set True once every read strategy has been tried and failed
-                        "compilation_path": None,  # set once a screenshot compilation has been saved
-                        "cache_dir": cache_dir,  # where this video's snapshots live (inside `folder`)
+                        "broken": False,
+                        "compilation_path": None,
+                        "cache_dir": cache_dir,
                     })
+    else:
+        with os.scandir(folder) as it:
+            for entry in it:
+                if entry.is_file():
+                    ext = os.path.splitext(entry.name)[1].lower()
+                    if ext in VIDEO_EXTENSIONS:
+                        videos.append({
+                            "id": make_id(entry.path),
+                            "filename": entry.name,
+                            "path": entry.path,
+                            "size": entry.stat().st_size,
+                            "status": "pending",
+                            "destination": None,
+                            "broken": False,  # set True once every read strategy has been tried and failed
+                            "compilation_path": None,  # set once a screenshot compilation has been saved
+                            "cache_dir": cache_dir,  # where this video's snapshots live (inside `folder`)
+                        })
+
     videos.sort(key=lambda v: v["filename"].lower())
     return videos
 
@@ -634,12 +661,14 @@ def single_video_entry(path):
     }
 
 
-def resolve_video_selection(raw_path):
+def resolve_video_selection(raw_path, recursive=False):
     """Given whatever path the person typed, pasted, or picked — a folder
     of videos, or a single video file — return (base_folder, videos).
     `base_folder` is used for the cache/trash directories and as the
     default location for anything that isn't a single-file compilation
     override, so a single file resolves to its parent directory here.
+    `recursive` only applies to a folder selection — a single file is
+    always just that one file regardless of the flag.
     Raises ValueError with a person-facing message on anything invalid."""
     p = Path(raw_path)
 
@@ -649,7 +678,7 @@ def resolve_video_selection(raw_path):
         return str(p.parent), [single_video_entry(p)]
 
     if p.is_dir():
-        return str(p), list_videos_in_folder(str(p))
+        return str(p), list_videos_in_folder(str(p), recursive=recursive)
 
     raise ValueError("That path could not be found.")
 
@@ -658,12 +687,13 @@ def resolve_video_selection(raw_path):
 def scan():
     data = request.get_json(force=True)
     raw_path = (data.get("path") or "").strip().strip('"')
+    recursive = bool(data.get("recursive"))
 
     if not raw_path:
         return jsonify({"success": False, "error": "Choose or paste a folder or video file path first."})
 
     try:
-        folder, videos = resolve_video_selection(raw_path)
+        folder, videos = resolve_video_selection(raw_path, recursive=recursive)
     except ValueError as e:
         return jsonify({"success": False, "error": str(e)})
 
@@ -1415,7 +1445,7 @@ def start_compile_batch():
             return jsonify({"success": False, "error": "A compilation job is already running."})
 
     try:
-        _folder, videos = resolve_video_selection(raw_path)
+        _folder, videos = resolve_video_selection(raw_path, recursive=bool(data.get("recursive")))
     except ValueError as e:
         return jsonify({"success": False, "error": str(e)})
 
