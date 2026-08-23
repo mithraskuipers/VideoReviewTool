@@ -83,6 +83,33 @@ MIN_COMPILATION_SHOTS = 4
 MAX_COMPILATION_SHOTS = 64
 COMPILATION_SUFFIX = "_screenshot_overview"
 COMPILATION_TILE_MAX_W = 480
+OVERVIEW_EXTENSIONS = (".jpg", ".jpeg", ".png")
+
+# --------------------------------------------------------------------------
+# Linking existing screenshot-overview images back to their videos.
+#
+# A compilation image is always named "<video stem>_screenshot_overview.jpg"
+# (see compilation_output_path above), saved either next to the source video
+# or in a separate output folder. That naming convention is also what lets
+# us go the other direction: given a video, look for a same-basename
+# overview image either right beside it or in a separate folder the person
+# points at, so a folder that already has overviews from a previous session
+# (or from someone else entirely) can be recognized and sorted by, without
+# regenerating anything.
+# --------------------------------------------------------------------------
+
+
+def find_overview_file(video_path, overview_dir=None):
+    """Return the Path to an existing screenshot-overview image for
+    `video_path`, or None if there isn't one. Looks in `overview_dir` if
+    given, otherwise right next to the video itself."""
+    p = Path(video_path)
+    search_dir = Path(overview_dir) if overview_dir else p.parent
+    for ext in OVERVIEW_EXTENSIONS:
+        candidate = search_dir / f"{p.stem}{COMPILATION_SUFFIX}{ext}"
+        if candidate.is_file():
+            return candidate
+    return None
 
 # --------------------------------------------------------------------------
 # Per-folder cache & trash directories.
@@ -356,6 +383,7 @@ state = {
     "num_snapshots": DEFAULT_NUM_SNAPSHOTS,
     "settings": load_settings(),
     "last_action": None,  # the most recent action, kept around so it can be undone (see /api/undo)
+    "review_mode": "thumbnails",  # "thumbnails" (live slideshow) or "overview" (static screenshot-overview image)
 }
 state["num_snapshots"] = state["settings"]["default_num_snapshots"]
 
@@ -387,6 +415,17 @@ def finalize_pending_delete():
         except Exception:
             pass
         _rmdir_if_empty(Path(held_path).parent)
+
+    # If this video had a companion screenshot-overview image, it was held
+    # alongside it (see /api/action) purely so the delete stayed undoable.
+    # Now that it's no longer undoable, finalize that too.
+    held_overview_path = record.get("held_overview_path")
+    if held_overview_path and os.path.exists(held_overview_path):
+        try:
+            send2trash(held_overview_path)
+        except Exception:
+            pass
+        _rmdir_if_empty(Path(held_overview_path).parent)
 
 
 def make_id(path: str) -> str:
@@ -528,6 +567,7 @@ def stop():
         state["folder"] = None
         state["videos"] = []
         state["current_index"] = 0
+        state["review_mode"] = "thumbnails"
     remove_folder_dirs(folder)
     return jsonify({"success": True})
 
@@ -588,6 +628,66 @@ def exclude_videos():
     return jsonify({"success": True, "count": count, "videos": videos})
 
 
+@app.route("/api/scan_overviews", methods=["POST"])
+def scan_overviews():
+    """Re-check which of the currently-scanned videos already have a
+    screenshot-overview image, optionally looking in a separate folder
+    instead of right next to each video (for setups where overviews are
+    kept apart from the originals). Used by the "Sort by screenshot
+    overview" flow to report how many videos are ready to review as-is and
+    how many still need a compilation generated first."""
+    data = request.get_json(silent=True) or {}
+    overview_dir = (data.get("overview_dir") or "").strip().strip('"') or None
+
+    if overview_dir and not os.path.isdir(overview_dir):
+        return jsonify({"success": False, "error": "That screenshot-overview folder could not be found."})
+
+    with state_lock:
+        for v in state["videos"]:
+            found = find_overview_file(v["path"], overview_dir)
+            v["overview_path"] = str(found) if found else None
+        videos = list(state["videos"])
+
+    with_overview = sum(1 for v in videos if v.get("overview_path"))
+    return jsonify({
+        "success": True,
+        "videos": videos,
+        "overview_dir": overview_dir,
+        "with_overview": with_overview,
+        "without_overview": len(videos) - with_overview,
+    })
+
+
+@app.route("/api/review_mode", methods=["POST"])
+def set_review_mode():
+    """Switch how the review screen previews each video: "thumbnails" (the
+    default live slideshow) or "overview" (show the existing screenshot-
+    overview image instead, skipping video decoding entirely)."""
+    data = request.get_json(force=True)
+    mode = data.get("mode")
+    if mode not in ("thumbnails", "overview"):
+        return jsonify({"success": False, "error": "Invalid review mode"})
+
+    with state_lock:
+        state["review_mode"] = mode
+
+    return jsonify({"success": True, "review_mode": mode})
+
+
+@app.route("/api/overview_image/<vid>")
+def overview_image(vid):
+    with state_lock:
+        video = find_video(vid)
+
+    if not video or not video.get("overview_path") or not os.path.isfile(video["overview_path"]):
+        return "", 404
+
+    # max_age=0: unlike thumbnails, an overview image can be regenerated
+    # (via the Compile action) at the same path, so it must never be served
+    # stale from the browser cache.
+    return send_file(video["overview_path"], mimetype="image/jpeg", max_age=0)
+
+
 def list_videos_in_folder(folder, recursive=False):
     """Scan a folder for supported video files and build the same video-dict
     shape used everywhere else (id/filename/path/size/status/...). Shared by
@@ -609,6 +709,7 @@ def list_videos_in_folder(folder, recursive=False):
                 ext = os.path.splitext(name)[1].lower()
                 if ext in VIDEO_EXTENSIONS:
                     full_path = os.path.join(root, name)
+                    overview = find_overview_file(full_path)
                     videos.append({
                         "id": make_id(full_path),
                         "filename": name,
@@ -618,6 +719,7 @@ def list_videos_in_folder(folder, recursive=False):
                         "destination": None,
                         "broken": False,
                         "compilation_path": None,
+                        "overview_path": str(overview) if overview else None,
                         "cache_dir": cache_dir,
                     })
     else:
@@ -626,6 +728,7 @@ def list_videos_in_folder(folder, recursive=False):
                 if entry.is_file():
                     ext = os.path.splitext(entry.name)[1].lower()
                     if ext in VIDEO_EXTENSIONS:
+                        overview = find_overview_file(entry.path)
                         videos.append({
                             "id": make_id(entry.path),
                             "filename": entry.name,
@@ -635,6 +738,7 @@ def list_videos_in_folder(folder, recursive=False):
                             "destination": None,
                             "broken": False,  # set True once every read strategy has been tried and failed
                             "compilation_path": None,  # set once a screenshot compilation has been saved
+                            "overview_path": str(overview) if overview else None,  # existing screenshot-overview image, if any
                             "cache_dir": cache_dir,  # where this video's snapshots live (inside `folder`)
                         })
 
@@ -648,6 +752,7 @@ def single_video_entry(path):
     whole folder to scan)."""
     p = Path(path)
     cache_dir = str(get_cache_dir(p.parent))
+    overview = find_overview_file(str(p))
     return {
         "id": make_id(str(p)),
         "filename": p.name,
@@ -657,6 +762,7 @@ def single_video_entry(path):
         "destination": None,
         "broken": False,
         "compilation_path": None,
+        "overview_path": str(overview) if overview else None,
         "cache_dir": cache_dir,
     }
 
@@ -708,6 +814,7 @@ def scan():
         state["videos"] = videos
         state["current_index"] = 0
         state["num_snapshots"] = num_snapshots
+        state["review_mode"] = "thumbnails"  # a fresh scan always starts in normal slideshow mode
         state["settings"]["default_num_snapshots"] = num_snapshots
         settings_snapshot = dict(state["settings"])
 
@@ -748,6 +855,7 @@ def status():
             "settings": state["settings"],
             "can_undo": undo_info is not None,
             "undo_info": undo_info,
+            "review_mode": state.get("review_mode", "thumbnails"),
         })
 
 
@@ -1232,6 +1340,21 @@ def action():
                 record["orig_path"] = orig_path
                 record["held_path"] = str(held_path)
 
+                # Keep a companion screenshot-overview image (if any) from
+                # being left behind as clutter — hold it alongside the video
+                # so this stays undoable too, and it gets sent to the real
+                # trash together with the video by finalize_pending_delete().
+                overview_path = video.get("overview_path")
+                if overview_path and os.path.isfile(overview_path):
+                    held_overview_path = _unique_dest(trash_dir / Path(overview_path).name)
+                    try:
+                        shutil.move(overview_path, str(held_overview_path))
+                        record["orig_overview_path"] = overview_path
+                        record["held_overview_path"] = str(held_overview_path)
+                        video["overview_path"] = str(held_overview_path)
+                    except Exception:
+                        pass  # non-fatal — the video delete itself already succeeded
+
             elif act == "keep":
                 video["status"] = "kept"
 
@@ -1247,6 +1370,7 @@ def action():
                     return jsonify({"success": False, "error": f"Could not create the screenshot compilation: {e}"})
                 video["status"] = "compiled"
                 video["compilation_path"] = str(out_path)
+                video["overview_path"] = str(out_path)
                 record["compilation_path"] = str(out_path)
                 record["num_shots"] = num_shots
 
@@ -1278,6 +1402,19 @@ def action():
                 video["destination"] = folder
                 record["orig_path"] = orig_path
                 record["dest_path"] = dest
+
+                # Move a companion screenshot-overview image along with its
+                # video, so the two stay together in the sorted subfolder.
+                overview_path = video.get("overview_path")
+                if overview_path and os.path.isfile(overview_path):
+                    dest_overview = str(_unique_dest(Path(dest).with_name(Path(overview_path).name)))
+                    try:
+                        shutil.move(overview_path, dest_overview)
+                        record["orig_overview_path"] = overview_path
+                        record["dest_overview_path"] = dest_overview
+                        video["overview_path"] = dest_overview
+                    except Exception:
+                        pass  # non-fatal — the video move itself already succeeded
 
         except Exception as e:
             return jsonify({"success": False, "error": str(e)})
@@ -1330,6 +1467,12 @@ def undo():
                     shutil.move(held_path, orig_path)
                 video["path"] = orig_path
 
+                held_overview_path = record.get("held_overview_path")
+                orig_overview_path = record.get("orig_overview_path")
+                if held_overview_path and orig_overview_path and os.path.exists(held_overview_path):
+                    shutil.move(held_overview_path, orig_overview_path)
+                    video["overview_path"] = orig_overview_path
+
             elif record["type"] == "move":
                 orig_path = record["orig_path"]
                 dest_path = record["dest_path"]
@@ -1337,6 +1480,12 @@ def undo():
                     shutil.move(dest_path, orig_path)
                 video["path"] = orig_path
                 video["destination"] = None
+
+                dest_overview_path = record.get("dest_overview_path")
+                orig_overview_path = record.get("orig_overview_path")
+                if dest_overview_path and orig_overview_path and os.path.exists(dest_overview_path):
+                    shutil.move(dest_overview_path, orig_overview_path)
+                    video["overview_path"] = orig_overview_path
 
             elif record["type"] == "compile":
                 comp_path = record.get("compilation_path")
@@ -1346,6 +1495,8 @@ def undo():
                     except OSError:
                         pass
                 video["compilation_path"] = None
+                if video.get("overview_path") == comp_path:
+                    video["overview_path"] = None
 
             # keep / skip / auto_skip performed no file operation, so there's
             # nothing to reverse beyond resetting status below.
@@ -1405,15 +1556,27 @@ def _compilation_worker(num_shots, videos, output_dir):
                         break
 
             new_status = "done"
+            out_path = None
             if os.path.isfile(video["path"]):
                 try:
-                    save_compilation_image(video["path"], num_shots, output_dir)
+                    out_path = save_compilation_image(video["path"], num_shots, output_dir)
                 except Exception:
                     new_status = "failed"
                     with _compilation_lock:
                         _compilation_state["failed"].append(video["filename"])
             else:
                 new_status = "failed"
+
+            if out_path is not None:
+                # If this video is also part of the live review queue (same
+                # session), keep its overview_path in sync so "Sort by
+                # screenshot overview" immediately sees the new image
+                # without needing a fresh scan.
+                with state_lock:
+                    sv = find_video(video["id"])
+                    if sv:
+                        sv["compilation_path"] = str(out_path)
+                        sv["overview_path"] = str(out_path)
 
             with _compilation_lock:
                 _compilation_state["done_videos"] += 1

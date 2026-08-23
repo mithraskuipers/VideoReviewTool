@@ -84,6 +84,11 @@
           <span class="option-card-title">Create screenshot compilations</span>
           <span class="option-card-desc">Generate a single grid image of evenly-spaced screenshots for each video.</span>
         </button>
+        <button id="option-overview-btn" class="option-card">
+          <span class="option-card-icon">🗂</span>
+          <span class="option-card-title">Sort by screenshot overview</span>
+          <span class="option-card-desc">Already have (or want) a screenshot-grid image per video? Judge and sort from that instead of a live slideshow.</span>
+        </button>
       </div>
 
       <button id="mode-back-btn" class="btn btn-secondary">← Back</button>
@@ -256,8 +261,53 @@
 
       <div class="step-actions">
         <button id="compile-batch-cancel-btn" class="btn btn-secondary" disabled>Cancel</button>
+        <button id="compile-batch-back-to-overview-btn" class="btn btn-secondary hidden">← Back to sort-by-overview</button>
         <button id="compile-batch-done-btn" class="btn btn-primary hidden">Done — start over</button>
       </div>
+    </div>
+  </section>
+
+  <!-- ===================== STEP 3C: SORT BY SCREENSHOT OVERVIEW ===================== -->
+  <section id="overview-settings-screen" class="screen hidden">
+    <div class="setup-card">
+      <div class="brand">
+        <span class="brand-mark small">🗂</span>
+        <div>
+          <h1>Sort by screenshot overview</h1>
+          <p class="subtitle">Judge each video from its existing screenshot-overview grid instead of a live slideshow.</p>
+        </div>
+      </div>
+
+      <div class="path-row">
+        <input id="overview-dir-input" type="text" placeholder="Screenshot overviews stored in a different folder? Paste it here (optional)" />
+        <button id="overview-dir-browse-btn" class="btn btn-secondary">Browse…</button>
+      </div>
+      <p class="dropzone-hint" style="margin:6px 0 0;">
+        Leave this blank to look for <code>&lt;filename&gt;_screenshot_overview.jpg</code> right next to each video —
+        the default location used when creating compilations.
+      </p>
+      <button id="overview-rescan-btn" class="btn btn-secondary btn-block" style="margin-top:10px;">🔍 Check which videos have an overview ready</button>
+
+      <p id="overview-status-text" class="dropzone-hint" style="margin:16px 0 0; text-align:center;">Checking…</p>
+
+      <ul id="overview-scan-list" class="queue-list" style="margin-top:10px; max-height:220px; overflow-y:auto;"></ul>
+
+      <p class="mode-prompt">How would you like to proceed?</p>
+      <div class="option-cards">
+        <button id="overview-review-btn" class="option-card" disabled>
+          <span class="option-card-icon">▶</span>
+          <span class="option-card-title">Review the ones that are ready</span>
+          <span class="option-card-desc" id="overview-review-desc">Sort videos that already have a screenshot overview.</span>
+        </button>
+        <button id="overview-generate-btn" class="option-card" disabled>
+          <span class="option-card-icon">🖼</span>
+          <span class="option-card-title">Generate the missing overviews first</span>
+          <span class="option-card-desc" id="overview-generate-desc">Create screenshot overviews for videos that don't have one yet.</span>
+        </button>
+      </div>
+
+      <button id="overview-back-btn" class="btn btn-secondary">← Back</button>
+      <p id="overview-message" class="message"></p>
     </div>
   </section>
 
@@ -318,7 +368,7 @@
       <!-- Sidebar -->
       <aside class="sidebar">
 
-        <div class="panel">
+        <div class="panel" id="playback-panel">
           <h3>Playback</h3>
           <div class="playback-settings">
             <div class="playback-row">

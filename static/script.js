@@ -7,10 +7,11 @@ const modeScreen = document.getElementById('mode-screen');
 const reviewSettingsScreen = document.getElementById('review-settings-screen');
 const compileSettingsScreen = document.getElementById('compile-settings-screen');
 const compileProgressScreen = document.getElementById('compile-progress-screen');
+const overviewSettingsScreen = document.getElementById('overview-settings-screen');
 const reviewScreen = document.getElementById('review-screen');
 const doneScreen = document.getElementById('done-screen');
 const allScreens = [introScreen, modeScreen, reviewSettingsScreen, compileSettingsScreen,
-  compileProgressScreen, reviewScreen, doneScreen];
+  compileProgressScreen, overviewSettingsScreen, reviewScreen, doneScreen];
 
 function showScreen(target) {
   allScreens.forEach(s => { if (s) s.classList.toggle('hidden', s !== target); });
@@ -30,6 +31,7 @@ const modeBackBtn = document.getElementById('mode-back-btn');
 const modeMessage = document.getElementById('mode-message');
 const optionReviewBtn = document.getElementById('option-review-btn');
 const optionCompileBtn = document.getElementById('option-compile-btn');
+const optionOverviewBtn = document.getElementById('option-overview-btn');
 const scanList = document.getElementById('scan-list');
 
 const reviewSettingsBackBtn = document.getElementById('review-settings-back-btn');
@@ -133,6 +135,7 @@ const doneSummary = document.getElementById('done-summary');
 
 let scannedVideos = [];
 let deselectedVideoIds = new Set(); // ids the person unchecked in the scan-results list
+let reviewMode = 'thumbnails'; // 'thumbnails' (live slideshow) or 'overview' (static screenshot-overview image)
 let slideshowTimer = null;
 let slideshowIdx = 0;
 let currentVideo = null;
@@ -174,6 +177,24 @@ const compileFileList = document.getElementById('compile-file-list');
 const compileBatchMessage = document.getElementById('compile-batch-message');
 const compileBatchCancelBtn = document.getElementById('compile-batch-cancel-btn');
 const compileBatchDoneBtn = document.getElementById('compile-batch-done-btn');
+const compileBatchBackToOverviewBtn = document.getElementById('compile-batch-back-to-overview-btn');
+
+/* ---------------- Sort by screenshot overview ---------------- */
+
+const overviewDirInput = document.getElementById('overview-dir-input');
+const overviewDirBrowseBtn = document.getElementById('overview-dir-browse-btn');
+const overviewRescanBtn = document.getElementById('overview-rescan-btn');
+const overviewStatusText = document.getElementById('overview-status-text');
+const overviewScanList = document.getElementById('overview-scan-list');
+const overviewReviewBtn = document.getElementById('overview-review-btn');
+const overviewReviewDesc = document.getElementById('overview-review-desc');
+const overviewGenerateBtn = document.getElementById('overview-generate-btn');
+const overviewGenerateDesc = document.getElementById('overview-generate-desc');
+const overviewBackBtn = document.getElementById('overview-back-btn');
+const overviewMessage = document.getElementById('overview-message');
+
+let overviewScanResults = []; // videos (with overview_path resolved for the current overview_dir) shown on this screen
+let compileBatchFromOverview = false; // true when the running compile batch was launched from this screen
 
 const reviewCompilationSlider = document.getElementById('review-compilation-slider');
 const reviewCompilationValue = document.getElementById('review-compilation-value');
@@ -820,6 +841,20 @@ optionCompileBtn.addEventListener('click', () => {
   showScreen(compileSettingsScreen);
 });
 
+if (optionOverviewBtn) {
+  optionOverviewBtn.addEventListener('click', () => {
+    overviewMessage.textContent = '';
+    overviewDirInput.value = '';
+    // scannedVideos already carries overview_path from /api/scan (which
+    // checks right next to each video by default), so the first render
+    // here needs no extra round trip — Rescan only matters once the person
+    // points at a separate overview folder.
+    overviewScanResults = scannedVideos;
+    renderOverviewScreen();
+    showScreen(overviewSettingsScreen);
+  });
+}
+
 reviewSettingsBackBtn.addEventListener('click', () => {
   showScreen(modeScreen);
 });
@@ -827,6 +862,12 @@ reviewSettingsBackBtn.addEventListener('click', () => {
 compileSettingsBackBtn.addEventListener('click', () => {
   showScreen(modeScreen);
 });
+
+if (overviewBackBtn) {
+  overviewBackBtn.addEventListener('click', () => {
+    showScreen(modeScreen);
+  });
+}
 
 /* ---------------- Prepare mode: pre-cache snapshots ahead of time ---------------- */
 
@@ -1039,55 +1080,68 @@ if (compileOutputBrowseBtn) {
   });
 }
 
-if (compileStartBtn) {
-  compileStartBtn.addEventListener('click', async () => {
-    const path = (pathInput.value || '').trim();
-    if (!path) {
-      compileSettingsMessage.textContent = 'Choose or paste a folder or video file path first.';
+// Shared by both entry points into batch compilation: the normal "Create
+// screenshot compilations" flow, and "Generate the missing overviews first"
+// from the Sort-by-overview screen. `messageEl`/`triggerBtn` are whichever
+// setup screen's own message/button the caller wants updated on failure.
+async function launchCompileBatch({ path, excludedIds, outputDir, fromOverview, messageEl, triggerBtn, idleLabel }) {
+  if (!path) {
+    messageEl.textContent = 'Choose or paste a folder or video file path first.';
+    return;
+  }
+
+  messageEl.textContent = '';
+  if (triggerBtn) { triggerBtn.disabled = true; triggerBtn.textContent = 'Starting…'; }
+
+  try {
+    const res = await fetch('/api/compile_batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        path,
+        num_shots: getCompilationShots(),
+        excluded_ids: excludedIds,
+        output_dir: outputDir || '',
+        recursive: scanRecursive,
+      }),
+    });
+    const data = await res.json();
+    if (!data.success) {
+      messageEl.textContent = data.error || 'Could not start creating compilations for that folder.';
+      if (triggerBtn) { triggerBtn.disabled = false; triggerBtn.textContent = idleLabel; }
       return;
     }
+    if (triggerBtn) { triggerBtn.disabled = false; triggerBtn.textContent = idleLabel; }
 
-    compileSettingsMessage.textContent = '';
-    compileStartBtn.disabled = true;
-    compileStartBtn.textContent = 'Starting…';
+    compileBatchFromOverview = !!fromOverview;
+    compileProgressSubtitle.textContent = `${data.total} video${data.total === 1 ? '' : 's'} · ${data.num_shots} screenshots each`;
+    compileBatchFill.style.width = '0%';
+    compileBatchProgressLabel.textContent = `0 / ${data.total} · 0%`;
+    compileFileList.innerHTML = '';
+    compileBatchMessage.style.color = '';
+    compileBatchMessage.textContent = '';
+    compileBatchCancelBtn.disabled = false;
+    compileBatchDoneBtn.classList.add('hidden');
+    if (compileBatchBackToOverviewBtn) compileBatchBackToOverviewBtn.classList.add('hidden');
+    showScreen(compileProgressScreen);
+    pollCompileBatchStatus();
+  } catch (e) {
+    messageEl.textContent = 'Could not reach the local server.';
+    if (triggerBtn) { triggerBtn.disabled = false; triggerBtn.textContent = idleLabel; }
+  }
+}
 
-    try {
-      const res = await fetch('/api/compile_batch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          path,
-          num_shots: getCompilationShots(),
-          excluded_ids: getExcludedIdsForBatch(),
-          output_dir: (compileOutputInput.value || '').trim(),
-          recursive: scanRecursive,
-        }),
-      });
-      const data = await res.json();
-      if (!data.success) {
-        compileSettingsMessage.textContent = data.error || 'Could not start creating compilations for that folder.';
-        compileStartBtn.disabled = false;
-        compileStartBtn.textContent = compileStartIdleLabel;
-        return;
-      }
-      compileStartBtn.disabled = false;
-      compileStartBtn.textContent = compileStartIdleLabel;
-
-      compileProgressSubtitle.textContent = `${data.total} video${data.total === 1 ? '' : 's'} · ${data.num_shots} screenshots each`;
-      compileBatchFill.style.width = '0%';
-      compileBatchProgressLabel.textContent = `0 / ${data.total} · 0%`;
-      compileFileList.innerHTML = '';
-      compileBatchMessage.style.color = '';
-      compileBatchMessage.textContent = '';
-      compileBatchCancelBtn.disabled = false;
-      compileBatchDoneBtn.classList.add('hidden');
-      showScreen(compileProgressScreen);
-      pollCompileBatchStatus();
-    } catch (e) {
-      compileSettingsMessage.textContent = 'Could not reach the local server.';
-      compileStartBtn.disabled = false;
-      compileStartBtn.textContent = compileStartIdleLabel;
-    }
+if (compileStartBtn) {
+  compileStartBtn.addEventListener('click', () => {
+    launchCompileBatch({
+      path: (pathInput.value || '').trim(),
+      excludedIds: getExcludedIdsForBatch(),
+      outputDir: (compileOutputInput.value || '').trim(),
+      fromOverview: false,
+      messageEl: compileSettingsMessage,
+      triggerBtn: compileStartBtn,
+      idleLabel: compileStartIdleLabel,
+    });
   });
 
   compileBatchCancelBtn.addEventListener('click', async () => {
@@ -1100,6 +1154,13 @@ if (compileStartBtn) {
   });
 
   compileBatchDoneBtn.addEventListener('click', () => location.reload());
+
+  if (compileBatchBackToOverviewBtn) {
+    compileBatchBackToOverviewBtn.addEventListener('click', async () => {
+      await rescanOverviews(); // pick up the overviews that were just generated
+      showScreen(overviewSettingsScreen);
+    });
+  }
 }
 
 function pollCompileBatchStatus() {
@@ -1150,6 +1211,9 @@ function renderCompileBatchStatus(data) {
 function onCompileBatchFinished(data) {
   compileBatchCancelBtn.disabled = true;
   compileBatchDoneBtn.classList.remove('hidden');
+  if (compileBatchBackToOverviewBtn) {
+    compileBatchBackToOverviewBtn.classList.toggle('hidden', !compileBatchFromOverview);
+  }
   compileBatchMessage.style.color = '';
 
   if (data.error) {
@@ -1166,6 +1230,136 @@ function onCompileBatchFinished(data) {
   }
   compileBatchMessage.style.color = 'var(--success)';
   compileBatchMessage.textContent = msg;
+}
+
+function renderOverviewScreen() {
+  const active = overviewScanResults.filter(v => !deselectedVideoIds.has(v.id));
+  const withOverview = active.filter(v => v.overview_path);
+  const withoutOverview = active.filter(v => !v.overview_path);
+
+  overviewStatusText.textContent = active.length
+    ? `${withOverview.length} of ${active.length} video${active.length === 1 ? '' : 's'} already ${active.length === 1 ? 'has' : 'have'} a screenshot overview ready.` +
+      (withoutOverview.length ? ` ${withoutOverview.length} still need one.` : '')
+    : 'No videos are selected.';
+
+  overviewReviewBtn.disabled = withOverview.length === 0;
+  overviewGenerateBtn.disabled = withoutOverview.length === 0;
+
+  overviewReviewDesc.textContent = withOverview.length
+    ? `Sort the ${withOverview.length} video${withOverview.length === 1 ? '' : 's'} that already ${withOverview.length === 1 ? 'has' : 'have'} an overview.`
+    : 'None yet — generate some first.';
+  overviewGenerateDesc.textContent = withoutOverview.length
+    ? `Create overviews for the ${withoutOverview.length} video${withoutOverview.length === 1 ? '' : 's'} missing one.`
+    : 'Every selected video already has one.';
+
+  overviewScanList.innerHTML = active.map(v => `<li>
+      <span class="badge ${v.overview_path ? 'ready' : 'missing'}">${v.overview_path ? 'READY' : 'MISSING'}</span>
+      <span class="fname">${escapeHtml(v.filename)}</span>
+    </li>`).join('');
+}
+
+async function rescanOverviews() {
+  overviewMessage.textContent = '';
+  overviewRescanBtn.disabled = true;
+  const idle = overviewRescanBtn.textContent;
+  overviewRescanBtn.textContent = 'Checking…';
+  try {
+    const res = await fetch('/api/scan_overviews', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ overview_dir: (overviewDirInput.value || '').trim() }),
+    });
+    const data = await res.json();
+    if (!data.success) {
+      overviewMessage.textContent = data.error || 'Could not check that folder.';
+      return;
+    }
+    overviewScanResults = data.videos;
+    scannedVideos = data.videos; // keep the main scan results in sync too
+    renderOverviewScreen();
+  } catch (e) {
+    overviewMessage.textContent = 'Could not reach the local server.';
+  } finally {
+    overviewRescanBtn.disabled = false;
+    overviewRescanBtn.textContent = idle;
+  }
+}
+
+if (overviewRescanBtn) overviewRescanBtn.addEventListener('click', rescanOverviews);
+
+if (overviewDirBrowseBtn) {
+  overviewDirBrowseBtn.addEventListener('click', async () => {
+    overviewMessage.textContent = '';
+    overviewDirBrowseBtn.disabled = true;
+    try {
+      const res = await fetch('/api/browse', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: 'output' }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        overviewDirInput.value = data.path;
+      } else if (data.error && data.error !== 'Nothing selected') {
+        overviewMessage.textContent = data.error;
+      }
+    } catch (e) {
+      overviewMessage.textContent = 'Could not reach the local server.';
+    }
+    overviewDirBrowseBtn.disabled = false;
+  });
+}
+
+if (overviewReviewBtn) {
+  overviewReviewBtn.addEventListener('click', async () => {
+    if (overviewReviewBtn.disabled) return;
+    overviewMessage.textContent = '';
+
+    const notReadyIds = overviewScanResults.filter(v => !v.overview_path).map(v => v.id);
+    const excludeSet = new Set([...deselectedVideoIds, ...notReadyIds]);
+
+    try {
+      await fetch('/api/exclude', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: Array.from(excludeSet) }),
+      });
+      await fetch('/api/review_mode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: 'overview' }),
+      });
+    } catch (e) {
+      overviewMessage.textContent = 'Could not reach the local server.';
+      return;
+    }
+
+    reviewMode = 'overview';
+    showScreen(reviewScreen);
+    refreshStatus();
+  });
+}
+
+if (overviewGenerateBtn) {
+  overviewGenerateBtn.addEventListener('click', async () => {
+    if (overviewGenerateBtn.disabled) return;
+    const readyIds = overviewScanResults.filter(v => v.overview_path).map(v => v.id);
+    const excludedIds = Array.from(new Set([...deselectedVideoIds, ...readyIds]));
+    // Note: no triggerBtn/idleLabel passed here — overviewGenerateBtn is a
+    // card-style button with nested icon/title/desc spans, so swapping its
+    // textContent for a "Starting…" label (as the plain compile-settings
+    // button does) would wipe out that structure. Just disable it instead;
+    // the screen navigates away almost immediately either way.
+    overviewGenerateBtn.disabled = true;
+    await launchCompileBatch({
+      path: (pathInput.value || '').trim(),
+      excludedIds,
+      outputDir: (overviewDirInput.value || '').trim(),
+      fromOverview: true,
+      messageEl: overviewMessage,
+    });
+    overviewGenerateBtn.disabled = false; // harmless once already navigated to the progress screen
+  });
 }
 
 async function enterReviewScreen() {
@@ -1230,6 +1424,9 @@ async function refreshStatus() {
       updateSpeedLabels(ms);
     }
   }
+  reviewMode = data.review_mode || 'thumbnails';
+  reviewScreen.classList.toggle('overview-mode', reviewMode === 'overview');
+
   renderQueue(data);
   renderUnreadable(data);
   renderProgress(data);
@@ -1296,6 +1493,8 @@ function renderUnreadable(data) {
 }
 
 function loadPreview(video) {
+  if (reviewMode === 'overview') { loadOverviewPreview(video); return; }
+
   stopSlideshow();
   stopBrokenPoll();
   currentImages = null;
@@ -1328,6 +1527,34 @@ function loadPreview(video) {
   });
 
   startBrokenPoll(video, myToken);
+}
+
+/* "Sort by screenshot overview" mode: skip video decoding entirely and just
+   show the existing screenshot-overview grid image for this video. No
+   slideshow timer, no scrubber, no per-frame requests — just one image. */
+function loadOverviewPreview(video) {
+  stopSlideshow();
+  stopBrokenPoll();
+  currentImages = null;
+  frameScrubber.disabled = true;
+  previewLoading.classList.remove('hidden');
+  previewLoading.textContent = 'Loading screenshot overview…';
+
+  currentFilename.textContent = video.filename;
+  currentFilemeta.textContent = fmtSize(video.size);
+
+  const myToken = ++loadToken;
+  const img = new Image();
+  img.onload = () => {
+    if (myToken !== loadToken) return; // user already moved on — ignore
+    previewLoading.classList.add('hidden');
+    previewImg.src = img.src;
+  };
+  img.onerror = () => {
+    if (myToken !== loadToken) return;
+    previewLoading.textContent = 'No screenshot overview found for this video — Skip it, or press Compile to generate one now.';
+  };
+  img.src = `/api/overview_image/${video.id}?t=${Date.now()}`;
 }
 
 /* While a preview is loading, periodically check whether the backend has
