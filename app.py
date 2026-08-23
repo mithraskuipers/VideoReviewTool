@@ -13,6 +13,7 @@ import os
 import time
 import json
 import uuid
+import math
 import shutil
 import hashlib
 import threading
@@ -65,6 +66,23 @@ MAX_NUM_SNAPSHOTS = 100
 DEFAULT_SLIDESHOW_MS = 225  # 2x faster than the original 450ms default
 MIN_SLIDESHOW_MS = 50
 MAX_SLIDESHOW_MS = 3000
+
+# --------------------------------------------------------------------------
+# Screenshot compilation.
+#
+# An alternative to sorting: instead of moving/deleting a video, grab N
+# evenly-spaced frames straight from it (the same way preview thumbnails
+# are grabbed) and lay them out in a grid into a single image, saved right
+# next to the source video. The individual frames only ever exist as
+# in-memory arrays on the way to being pasted into the grid — nothing
+# per-frame is ever written to disk, so there's nothing to clean up
+# afterwards.
+# --------------------------------------------------------------------------
+DEFAULT_COMPILATION_SHOTS = 9
+MIN_COMPILATION_SHOTS = 4
+MAX_COMPILATION_SHOTS = 64
+COMPILATION_SUFFIX = "_screenshot_overview"
+COMPILATION_TILE_MAX_W = 480
 
 # --------------------------------------------------------------------------
 # Per-folder cache & trash directories.
@@ -240,8 +258,10 @@ SETTINGS_FILE = Path.home() / ".video_review_tool_settings.json"
 DEFAULT_SETTINGS = {
     "delete_key": "d",
     "keep_key": "k",
+    "compile_key": "c",
     "default_num_snapshots": DEFAULT_NUM_SNAPSHOTS,
     "slideshow_interval_ms": DEFAULT_SLIDESHOW_MS,
+    "compilation_shots": DEFAULT_COMPILATION_SHOTS,
     "sort_buttons": [
         {"id": "sort_1", "key": "1", "folder": "1"},
         {"id": "sort_2", "key": "2", "folder": "2"},
@@ -267,8 +287,10 @@ def normalize_settings(data):
     settings = {
         "delete_key": sanitize_key(data.get("delete_key"), "d"),
         "keep_key": sanitize_key(data.get("keep_key"), "k"),
+        "compile_key": sanitize_key(data.get("compile_key"), "c"),
         "default_num_snapshots": DEFAULT_NUM_SNAPSHOTS,
         "slideshow_interval_ms": DEFAULT_SLIDESHOW_MS,
+        "compilation_shots": DEFAULT_COMPILATION_SHOTS,
         "sort_buttons": [],
     }
 
@@ -284,6 +306,12 @@ def normalize_settings(data):
     except (TypeError, ValueError):
         pass
 
+    try:
+        shots = int(data.get("compilation_shots", DEFAULT_COMPILATION_SHOTS))
+        settings["compilation_shots"] = max(MIN_COMPILATION_SHOTS, min(MAX_COMPILATION_SHOTS, shots))
+    except (TypeError, ValueError):
+        pass
+
     for b in data.get("sort_buttons", []):
         key = sanitize_key(b.get("key"), "")
         folder = sanitize_folder_name(b.get("folder"))
@@ -296,7 +324,7 @@ def normalize_settings(data):
 
 
 def settings_are_valid(settings):
-    keys = [settings["delete_key"], settings["keep_key"]] + [b["key"] for b in settings["sort_buttons"]]
+    keys = [settings["delete_key"], settings["keep_key"], settings["compile_key"]] + [b["key"] for b in settings["sort_buttons"]]
     if any(not k or not k.isalnum() for k in keys):
         return False, "Every button needs a single letter or number as its key."
     if len(keys) != len(set(keys)):
@@ -387,7 +415,12 @@ def index():
 
 @app.route("/api/browse", methods=["POST"])
 def browse():
-    """Open a native folder picker on the machine running the server."""
+    """Open a native picker on the machine running the server. `mode`
+    selects which dialog to show: "folder" (default) or "output" both open
+    a directory picker; "file" opens a single-video file picker."""
+    data = request.get_json(silent=True) or {}
+    mode = data.get("mode", "folder")
+
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -395,12 +428,21 @@ def browse():
         root = tk.Tk()
         root.withdraw()
         root.attributes("-topmost", True)
-        folder = filedialog.askdirectory(title="Select folder with videos")
+
+        if mode == "file":
+            filetypes = [("Video files", " ".join(f"*{ext}" for ext in sorted(VIDEO_EXTENSIONS))),
+                         ("All files", "*.*")]
+            path = filedialog.askopenfilename(title="Select a video file", filetypes=filetypes)
+        elif mode == "output":
+            path = filedialog.askdirectory(title="Select an output folder")
+        else:
+            path = filedialog.askdirectory(title="Select folder with videos")
+
         root.destroy()
 
-        if not folder:
-            return jsonify({"success": False, "error": "No folder selected"})
-        return jsonify({"success": True, "path": folder})
+        if not path:
+            return jsonify({"success": False, "error": "Nothing selected"})
+        return jsonify({"success": True, "path": path})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
 
@@ -427,6 +469,9 @@ def save_settings():
         )
         normalized["slideshow_interval_ms"] = data.get("settings", {}).get(
             "slideshow_interval_ms", state["settings"]["slideshow_interval_ms"]
+        )
+        normalized["compilation_shots"] = data.get("settings", {}).get(
+            "compilation_shots", state["settings"]["compilation_shots"]
         )
         normalized = normalize_settings(normalized)
         state["settings"] = normalized
@@ -495,6 +540,54 @@ def clamp_num_snapshots(value, default=DEFAULT_NUM_SNAPSHOTS):
     return max(MIN_NUM_SNAPSHOTS, min(MAX_NUM_SNAPSHOTS, n))
 
 
+def clamp_compilation_shots(value, default=DEFAULT_COMPILATION_SHOTS):
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        n = default
+    return max(MIN_COMPILATION_SHOTS, min(MAX_COMPILATION_SHOTS, n))
+
+
+@app.route("/api/compilation_shots", methods=["POST"])
+def set_compilation_shots():
+    """Change how many screenshots go into a compilation grid, for the
+    folder currently being reviewed (mirrors /api/num_snapshots)."""
+    data = request.get_json(force=True)
+    try:
+        n = int(data.get("num_shots"))
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "error": "Invalid screenshot count"})
+
+    n = clamp_compilation_shots(n)
+
+    with state_lock:
+        state["settings"]["compilation_shots"] = n
+        settings_snapshot = dict(state["settings"])
+
+    persist_settings(settings_snapshot)
+    return jsonify({"success": True, "num_shots": n})
+
+
+@app.route("/api/exclude", methods=["POST"])
+def exclude_videos():
+    """Drop specific videos (by id) out of the current queue entirely —
+    used by the "deselect some files" checkboxes on the scan-results list,
+    so a video the person unchecks is never reviewed, sorted, or included
+    in a batch compilation run."""
+    data = request.get_json(force=True)
+    ids = set(data.get("ids") or [])
+
+    with state_lock:
+        if ids:
+            state["videos"] = [v for v in state["videos"] if v["id"] not in ids]
+            if state["current_index"] > len(state["videos"]):
+                state["current_index"] = len(state["videos"])
+        count = len(state["videos"])
+        videos = list(state["videos"])
+
+    return jsonify({"success": True, "count": count, "videos": videos})
+
+
 def list_videos_in_folder(folder):
     """Scan a folder for supported video files and build the same video-dict
     shape used everywhere else (id/filename/path/size/status/...). Shared by
@@ -515,25 +608,68 @@ def list_videos_in_folder(folder):
                         "status": "pending",
                         "destination": None,
                         "broken": False,  # set True once every read strategy has been tried and failed
+                        "compilation_path": None,  # set once a screenshot compilation has been saved
                         "cache_dir": cache_dir,  # where this video's snapshots live (inside `folder`)
                     })
     videos.sort(key=lambda v: v["filename"].lower())
     return videos
 
 
+def single_video_entry(path):
+    """Build the same video-dict shape as list_videos_in_folder(), but for
+    exactly one video file the person pointed at directly (rather than a
+    whole folder to scan)."""
+    p = Path(path)
+    cache_dir = str(get_cache_dir(p.parent))
+    return {
+        "id": make_id(str(p)),
+        "filename": p.name,
+        "path": str(p),
+        "size": p.stat().st_size,
+        "status": "pending",
+        "destination": None,
+        "broken": False,
+        "compilation_path": None,
+        "cache_dir": cache_dir,
+    }
+
+
+def resolve_video_selection(raw_path):
+    """Given whatever path the person typed, pasted, or picked — a folder
+    of videos, or a single video file — return (base_folder, videos).
+    `base_folder` is used for the cache/trash directories and as the
+    default location for anything that isn't a single-file compilation
+    override, so a single file resolves to its parent directory here.
+    Raises ValueError with a person-facing message on anything invalid."""
+    p = Path(raw_path)
+
+    if p.is_file():
+        if p.suffix.lower() not in VIDEO_EXTENSIONS:
+            raise ValueError("That file isn't a supported video format.")
+        return str(p.parent), [single_video_entry(p)]
+
+    if p.is_dir():
+        return str(p), list_videos_in_folder(str(p))
+
+    raise ValueError("That path could not be found.")
+
+
 @app.route("/api/scan", methods=["POST"])
 def scan():
     data = request.get_json(force=True)
-    folder = (data.get("path") or "").strip().strip('"')
+    raw_path = (data.get("path") or "").strip().strip('"')
 
-    if not folder or not os.path.isdir(folder):
-        return jsonify({"success": False, "error": "That folder path could not be found."})
+    if not raw_path:
+        return jsonify({"success": False, "error": "Choose or paste a folder or video file path first."})
+
+    try:
+        folder, videos = resolve_video_selection(raw_path)
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)})
 
     num_snapshots = clamp_num_snapshots(
         data.get("num_snapshots", state["settings"]["default_num_snapshots"])
     )
-
-    videos = list_videos_in_folder(folder)
 
     with state_lock:
         finalize_pending_delete()
@@ -554,6 +690,7 @@ def scan():
         "success": True,
         "count": len(videos),
         "videos": videos,
+        "folder": folder,
         "num_snapshots": num_snapshots,
         "settings": settings_snapshot,
     })
@@ -690,6 +827,122 @@ def make_placeholder_frame(width=640, height=360):
     y = (height + th) // 2
     cv2.putText(frame, text, (x, y), font, 0.7, (140, 140, 140), 2, cv2.LINE_AA)
     return frame
+
+
+def compilation_grid_dims(num_shots):
+    """Work out a rows x cols grid for N screenshots. Perfect squares come
+    out square (9 -> 3x3, 16 -> 4x4); anything else gets the smallest grid
+    that fits N tiles (10 -> 4x3, with the last two cells left blank)."""
+    cols = int(math.ceil(math.sqrt(num_shots)))
+    rows = int(math.ceil(num_shots / cols))
+    return rows, cols
+
+
+def compilation_output_path(video_path, output_dir=None):
+    """<output_dir or the video's own folder>/<video base filename>_screenshot_overview.jpg.
+    Defaults to right alongside the source video; if `output_dir` is given,
+    every compilation is written there instead (handy for keeping outputs
+    separate from a folder of originals)."""
+    p = Path(video_path)
+    name = f"{p.stem}{COMPILATION_SUFFIX}.jpg"
+    if output_dir:
+        return Path(output_dir) / name
+    return p.with_name(name)
+
+
+def format_timestamp(seconds):
+    """12.4 -> '0:12', 75 -> '1:15', 3725 -> '1:02:05'. Matches the format
+    people are used to seeing on video players/scrubbers."""
+    seconds = max(0, int(round(seconds)))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def draw_timestamp_label(tile, label):
+    """Burn a small timestamp into the top-right corner of one grid tile, on
+    a translucent dark backing plate so it stays legible over bright or busy
+    footage. Mutates and returns `tile`."""
+    h, w = tile.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = max(0.35, min(0.6, (w / 480.0) * 0.5))
+    thickness = 2 if font_scale >= 0.5 else 1
+    (text_w, text_h), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+
+    pad = max(3, int(text_h * 0.5))
+    box_w = min(w, text_w + pad * 2)
+    box_h = min(h, text_h + baseline + pad * 2)
+    x1 = w - 4
+    x0 = max(0, x1 - box_w)
+    y0 = 4
+    y1 = min(h, y0 + box_h)
+
+    overlay = tile.copy()
+    cv2.rectangle(overlay, (x0, y0), (x1, y1), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.55, tile, 0.45, 0, dst=tile)
+
+    text_x = x0 + pad
+    text_y = y0 + pad + text_h
+    cv2.putText(tile, label, (text_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+    return tile
+
+
+def build_compilation_image(path, num_shots):
+    """Grab `num_shots` evenly-spaced frames from the video (frame 1 of N at
+    1/N through the video, frame N at 100%) and lay them out into a single
+    grid image, with a small timestamp burned into the top-right corner of
+    each tile showing how far into the video that frame sits. Frames are
+    pulled straight from the video with grab_frame() (the same routine used
+    for on-screen preview thumbnails) and combined entirely in memory — no
+    per-frame image file is ever written to disk, so there is nothing left
+    over to clean up once the grid is built."""
+    rows, cols = compilation_grid_dims(num_shots)
+
+    frame_count, fps = _probe_video(path)
+    duration_seconds = (frame_count / fps) if frame_count > 0 and fps and fps > 0 else None
+
+    shots = []
+    with _get_video_lock(path):
+        for i in range(num_shots):
+            ratio = (i + 1) / num_shots
+            frame = run_with_timeout(lambda r=ratio: grab_frame(path, r))
+            if frame is None:
+                frame = make_placeholder_frame()
+            shots.append((frame, ratio))
+
+    h0, w0 = shots[0][0].shape[:2]
+    if w0 > COMPILATION_TILE_MAX_W:
+        scale = COMPILATION_TILE_MAX_W / w0
+        tile_w, tile_h = COMPILATION_TILE_MAX_W, max(1, int(h0 * scale))
+    else:
+        tile_w, tile_h = w0, h0
+
+    grid = np.zeros((rows * tile_h, cols * tile_w, 3), dtype=np.uint8)
+    for i, (frame, ratio) in enumerate(shots):
+        tile = cv2.resize(frame, (tile_w, tile_h))
+        if duration_seconds is not None:
+            draw_timestamp_label(tile, format_timestamp(duration_seconds * ratio))
+        r, c = divmod(i, cols)
+        y0, x0 = r * tile_h, c * tile_w
+        grid[y0:y0 + tile_h, x0:x0 + tile_w] = tile
+
+    return grid
+
+
+def save_compilation_image(video_path, num_shots, output_dir=None):
+    """Build the grid for `video_path` and write it out (next to the source
+    video, or into `output_dir` if given). Returns the output Path. Raises
+    on failure."""
+    grid = build_compilation_image(video_path, num_shots)
+    out_path = compilation_output_path(video_path, output_dir)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    ok, buf = cv2.imencode(".jpg", grid, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    if not ok:
+        raise RuntimeError("Could not encode the compilation image")
+    out_path.write_bytes(buf.tobytes())
+    return out_path
 
 
 def _encode_and_cache(cache_dir, video_id, mtime, idx, num_snapshots, frame):
@@ -933,7 +1186,7 @@ def action():
 
         settings = state["settings"]
         orig_path = video["path"]
-        record = {"video_id": video["id"], "type": act if act in ("delete", "keep", "skip", "auto_skip") else "move"}
+        record = {"video_id": video["id"], "type": act if act in ("delete", "keep", "skip", "auto_skip", "compile") else "move"}
 
         try:
             if act == "delete":
@@ -951,6 +1204,21 @@ def action():
 
             elif act == "keep":
                 video["status"] = "kept"
+
+            elif act == "compile":
+                # Alternative to sorting: leave the file exactly where it is
+                # and instead save a screenshot-grid image next to it.
+                num_shots = clamp_compilation_shots(
+                    data.get("num_shots", settings.get("compilation_shots", DEFAULT_COMPILATION_SHOTS))
+                )
+                try:
+                    out_path = save_compilation_image(orig_path, num_shots)
+                except Exception as e:
+                    return jsonify({"success": False, "error": f"Could not create the screenshot compilation: {e}"})
+                video["status"] = "compiled"
+                video["compilation_path"] = str(out_path)
+                record["compilation_path"] = str(out_path)
+                record["num_shots"] = num_shots
 
             elif act == "skip":
                 # Just move past it — no file operation at all. Used as the
@@ -1040,6 +1308,15 @@ def undo():
                 video["path"] = orig_path
                 video["destination"] = None
 
+            elif record["type"] == "compile":
+                comp_path = record.get("compilation_path")
+                if comp_path and os.path.exists(comp_path):
+                    try:
+                        os.remove(comp_path)
+                    except OSError:
+                        pass
+                video["compilation_path"] = None
+
             # keep / skip / auto_skip performed no file operation, so there's
             # nothing to reverse beyond resetting status below.
 
@@ -1052,6 +1329,145 @@ def undo():
             state["current_index"] -= 1
         state["last_action"] = None
 
+    return jsonify({"success": True})
+
+
+# --------------------------------------------------------------------------
+# Batch screenshot-compilation mode.
+#
+# An alternative to the interactive review/sort flow: instead of stepping
+# through videos one at a time, generate a screenshot-compilation image for
+# every video in a folder in one background job (structured just like
+# Prepare mode below — a worker thread the setup screen polls for
+# progress). Videos the person has deselected in the scan results are
+# passed in as `excluded_ids` and skipped entirely.
+# --------------------------------------------------------------------------
+
+_compilation_lock = threading.Lock()
+_compilation_state = {
+    "running": False,
+    "folder": None,
+    "output_dir": None,
+    "num_shots": None,
+    "total_videos": 0,
+    "done_videos": 0,
+    "current_filename": None,
+    "current_id": None,
+    "videos": [],       # [{id, filename, status}], status: pending/processing/done/failed
+    "failed": [],       # filenames that could not be compiled
+    "cancelled": False,
+    "error": None,
+    "finished": False,
+}
+
+
+def _compilation_worker(num_shots, videos, output_dir):
+    try:
+        for video in videos:
+            with _compilation_lock:
+                if _compilation_state["cancelled"]:
+                    break
+                _compilation_state["current_filename"] = video["filename"]
+                _compilation_state["current_id"] = video["id"]
+                for v in _compilation_state["videos"]:
+                    if v["id"] == video["id"]:
+                        v["status"] = "processing"
+                        break
+
+            new_status = "done"
+            if os.path.isfile(video["path"]):
+                try:
+                    save_compilation_image(video["path"], num_shots, output_dir)
+                except Exception:
+                    new_status = "failed"
+                    with _compilation_lock:
+                        _compilation_state["failed"].append(video["filename"])
+            else:
+                new_status = "failed"
+
+            with _compilation_lock:
+                _compilation_state["done_videos"] += 1
+                for v in _compilation_state["videos"]:
+                    if v["id"] == video["id"]:
+                        v["status"] = new_status
+                        break
+    except Exception as e:
+        with _compilation_lock:
+            _compilation_state["error"] = str(e)
+    finally:
+        with _compilation_lock:
+            _compilation_state["running"] = False
+            _compilation_state["finished"] = True
+            _compilation_state["current_filename"] = None
+            _compilation_state["current_id"] = None
+
+
+@app.route("/api/compile_batch", methods=["POST"])
+def start_compile_batch():
+    data = request.get_json(force=True)
+    raw_path = (data.get("path") or "").strip().strip('"')
+
+    if not raw_path:
+        return jsonify({"success": False, "error": "Choose or paste a folder or video file path first."})
+
+    with _compilation_lock:
+        if _compilation_state["running"]:
+            return jsonify({"success": False, "error": "A compilation job is already running."})
+
+    try:
+        _folder, videos = resolve_video_selection(raw_path)
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)})
+
+    output_dir = (data.get("output_dir") or "").strip().strip('"') or None
+    if output_dir and not os.path.isdir(output_dir):
+        return jsonify({"success": False, "error": "That output folder could not be found."})
+
+    num_shots = clamp_compilation_shots(
+        data.get("num_shots", state["settings"].get("compilation_shots", DEFAULT_COMPILATION_SHOTS))
+    )
+
+    excluded = set(data.get("excluded_ids") or [])
+    if excluded:
+        videos = [v for v in videos if v["id"] not in excluded]
+
+    if not videos:
+        return jsonify({"success": False, "error": "No supported video files were found in that folder."})
+
+    with _compilation_lock:
+        _compilation_state.update({
+            "running": True,
+            "folder": _folder,
+            "output_dir": output_dir,
+            "num_shots": num_shots,
+            "total_videos": len(videos),
+            "done_videos": 0,
+            "current_filename": None,
+            "current_id": None,
+            "videos": [{"id": v["id"], "filename": v["filename"], "status": "pending"} for v in videos],
+            "failed": [],
+            "cancelled": False,
+            "error": None,
+            "finished": False,
+        })
+
+    threading.Thread(target=_compilation_worker, args=(num_shots, videos, output_dir), daemon=True).start()
+
+    return jsonify({"success": True, "total": len(videos), "num_shots": num_shots})
+
+
+@app.route("/api/compile_batch/status")
+def compile_batch_status():
+    with _compilation_lock:
+        return jsonify({"success": True, **_compilation_state})
+
+
+@app.route("/api/compile_batch/cancel", methods=["POST"])
+def compile_batch_cancel():
+    with _compilation_lock:
+        if not _compilation_state["running"]:
+            return jsonify({"success": False, "error": "No compilation job is running."})
+        _compilation_state["cancelled"] = True
     return jsonify({"success": True})
 
 

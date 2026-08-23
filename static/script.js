@@ -2,20 +2,39 @@ let SLIDESHOW_INTERVAL_MS = 225; // 2x faster than the original 450ms default; a
 let NUM_SNAPSHOTS = 20; // overwritten by the snapshot-count selector / server state
 let currentSettings = null; // { delete_key, keep_key, default_num_snapshots, sort_buttons: [{id,key,folder}] }
 
-const setupScreen = document.getElementById('setup-screen');
+const introScreen = document.getElementById('intro-screen');
+const modeScreen = document.getElementById('mode-screen');
+const reviewSettingsScreen = document.getElementById('review-settings-screen');
+const compileSettingsScreen = document.getElementById('compile-settings-screen');
+const compileProgressScreen = document.getElementById('compile-progress-screen');
 const reviewScreen = document.getElementById('review-screen');
 const doneScreen = document.getElementById('done-screen');
+const allScreens = [introScreen, modeScreen, reviewSettingsScreen, compileSettingsScreen,
+  compileProgressScreen, reviewScreen, doneScreen];
+
+function showScreen(target) {
+  allScreens.forEach(s => { if (s) s.classList.toggle('hidden', s !== target); });
+}
 
 const dropzone = document.getElementById('dropzone');
-const browseBtn = document.getElementById('browse-btn');
+const browseFolderBtn = document.getElementById('browse-folder-btn');
+const browseFileBtn = document.getElementById('browse-file-btn');
 const pathInput = document.getElementById('path-input');
-const scanBtn = document.getElementById('scan-btn');
-const setupMessage = document.getElementById('setup-message');
-const scanResults = document.getElementById('scan-results');
-const scanCount = document.getElementById('scan-count');
+const introMessage = document.getElementById('intro-message');
+const introNextBtn = document.getElementById('intro-next-btn');
+
+const modeHeading = document.getElementById('mode-heading');
+const modeLocation = document.getElementById('mode-location');
+const modeBackBtn = document.getElementById('mode-back-btn');
+const modeMessage = document.getElementById('mode-message');
+const optionReviewBtn = document.getElementById('option-review-btn');
+const optionCompileBtn = document.getElementById('option-compile-btn');
 const scanList = document.getElementById('scan-list');
+
+const reviewSettingsBackBtn = document.getElementById('review-settings-back-btn');
 const startBtn = document.getElementById('start-btn');
 const restartBtn = document.getElementById('restart-btn');
+const setupMessage = document.getElementById('setup-message');
 const snapshotPreset = document.getElementById('snapshot-preset');
 const snapshotCountInput = document.getElementById('snapshot-count');
 const snapshotIntervalLabel = document.getElementById('snapshot-interval');
@@ -112,6 +131,7 @@ const unreadableList = document.getElementById('unreadable-list');
 const doneSummary = document.getElementById('done-summary');
 
 let scannedVideos = [];
+let deselectedVideoIds = new Set(); // ids the person unchecked in the scan-results list
 let slideshowTimer = null;
 let slideshowIdx = 0;
 let currentVideo = null;
@@ -125,14 +145,103 @@ let brokenPollTimer = null; // polls while a video is loading to catch the backe
 const DEFAULT_SETTINGS = {
   delete_key: 'd',
   keep_key: 'k',
+  compile_key: 'c',
   default_num_snapshots: 20,
   slideshow_interval_ms: 225,
+  compilation_shots: 9,
   sort_buttons: [
     { id: 'sort_1', key: '1', folder: '1' },
     { id: 'sort_2', key: '2', folder: '2' },
     { id: 'sort_3', key: '3', folder: '3' },
   ],
 };
+
+/* ---------------- Screenshot compilation: shared helpers ---------------- */
+
+const compilationShotsSlider = document.getElementById('compilation-shots-slider');
+const compilationShotsValue = document.getElementById('compilation-shots-value');
+const compileOutputInput = document.getElementById('compile-output-input');
+const compileOutputBrowseBtn = document.getElementById('compile-output-browse-btn');
+const compileSettingsBackBtn = document.getElementById('compile-settings-back-btn');
+const compileStartBtn = document.getElementById('compile-start-btn');
+const compileSettingsMessage = document.getElementById('compile-settings-message');
+
+const compileProgressSubtitle = document.getElementById('compile-progress-subtitle');
+const compileBatchFill = document.getElementById('compile-batch-progress-fill');
+const compileBatchProgressLabel = document.getElementById('compile-batch-progress-label');
+const compileFileList = document.getElementById('compile-file-list');
+const compileBatchMessage = document.getElementById('compile-batch-message');
+const compileBatchCancelBtn = document.getElementById('compile-batch-cancel-btn');
+const compileBatchDoneBtn = document.getElementById('compile-batch-done-btn');
+
+const reviewCompilationSlider = document.getElementById('review-compilation-slider');
+const reviewCompilationValue = document.getElementById('review-compilation-value');
+const compileBtn = document.getElementById('compile-btn');
+const compileKeyKbd = document.getElementById('compile-key-kbd');
+
+const compileKeyInput = document.getElementById('compile-key-input');
+
+function clampCompilationShots(n) {
+  return Math.min(64, Math.max(4, n));
+}
+
+function compilationGridLabel(n) {
+  const cols = Math.ceil(Math.sqrt(n));
+  const rows = Math.ceil(n / cols);
+  const interval = Number.isInteger(100 / n) ? `${(100 / n).toFixed(0)}%` : `~${(100 / n).toFixed(1)}%`;
+  return `${n} (${rows} × ${cols} · every ${interval})`;
+}
+
+function updateCompilationLabels(n) {
+  const label = compilationGridLabel(n);
+  if (compilationShotsValue) compilationShotsValue.textContent = label;
+  if (reviewCompilationValue) reviewCompilationValue.textContent = label;
+}
+
+async function saveCompilationShots(n) {
+  try {
+    await fetch('/api/compilation_shots', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ num_shots: n }),
+    });
+    if (currentSettings) currentSettings.compilation_shots = n;
+  } catch (e) {
+    // non-critical — the chosen value still works for this session
+  }
+}
+
+function commitCompilationShots(n) {
+  n = clampCompilationShots(n);
+  if (compilationShotsSlider) compilationShotsSlider.value = n;
+  if (reviewCompilationSlider) reviewCompilationSlider.value = n;
+  updateCompilationLabels(n);
+  saveCompilationShots(n);
+}
+
+if (compilationShotsSlider) {
+  compilationShotsSlider.addEventListener('input', () => {
+    updateCompilationLabels(clampCompilationShots(parseInt(compilationShotsSlider.value, 10)));
+  });
+  compilationShotsSlider.addEventListener('change', () => {
+    commitCompilationShots(parseInt(compilationShotsSlider.value, 10));
+  });
+}
+
+if (reviewCompilationSlider) {
+  reviewCompilationSlider.addEventListener('input', () => {
+    updateCompilationLabels(clampCompilationShots(parseInt(reviewCompilationSlider.value, 10)));
+  });
+  reviewCompilationSlider.addEventListener('change', () => {
+    commitCompilationShots(parseInt(reviewCompilationSlider.value, 10));
+  });
+}
+
+function getCompilationShots() {
+  const n = (reviewCompilationSlider && parseInt(reviewCompilationSlider.value, 10)) ||
+    (currentSettings && currentSettings.compilation_shots) || 9;
+  return clampCompilationShots(n);
+}
 
 function fmtSize(bytes) {
   if (bytes < 1024) return bytes + ' B';
@@ -145,28 +254,56 @@ function fmtSize(bytes) {
 
 /* ---------------- Setup screen ---------------- */
 
-browseBtn.addEventListener('click', async () => {
-  setupMessage.textContent = '';
-  browseBtn.disabled = true;
-  browseBtn.textContent = 'Waiting for folder dialog…';
+browseFolderBtn.addEventListener('click', async () => {
+  introMessage.textContent = '';
+  browseFolderBtn.disabled = true;
+  const idle = browseFolderBtn.textContent;
+  browseFolderBtn.textContent = 'Waiting for folder dialog…';
   try {
-    const res = await fetch('/api/browse', { method: 'POST' });
+    const res = await fetch('/api/browse', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'folder' }),
+    });
     const data = await res.json();
     if (data.success) {
       pathInput.value = data.path;
-      doScan(data.path);
-    } else if (data.error && data.error !== 'No folder selected') {
-      setupMessage.textContent = data.error;
+    } else if (data.error && data.error !== 'Nothing selected') {
+      introMessage.textContent = data.error;
     }
   } catch (e) {
-    setupMessage.textContent = 'Could not reach the local server.';
+    introMessage.textContent = 'Could not reach the local server.';
   }
-  browseBtn.disabled = false;
-  browseBtn.textContent = 'Browse for folder…';
+  browseFolderBtn.disabled = false;
+  browseFolderBtn.textContent = idle;
 });
 
-scanBtn.addEventListener('click', () => doScan(pathInput.value));
-pathInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') doScan(pathInput.value); });
+browseFileBtn.addEventListener('click', async () => {
+  introMessage.textContent = '';
+  browseFileBtn.disabled = true;
+  const idle = browseFileBtn.textContent;
+  browseFileBtn.textContent = 'Waiting for file dialog…';
+  try {
+    const res = await fetch('/api/browse', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'file' }),
+    });
+    const data = await res.json();
+    if (data.success) {
+      pathInput.value = data.path;
+    } else if (data.error && data.error !== 'Nothing selected') {
+      introMessage.textContent = data.error;
+    }
+  } catch (e) {
+    introMessage.textContent = 'Could not reach the local server.';
+  }
+  browseFileBtn.disabled = false;
+  browseFileBtn.textContent = idle;
+});
+
+pathInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') goToModeScreen(); });
+introNextBtn.addEventListener('click', goToModeScreen);
 
 ['dragenter', 'dragover'].forEach(evt =>
   dropzone.addEventListener(evt, (e) => { e.preventDefault(); dropzone.classList.add('dragover'); })
@@ -175,14 +312,33 @@ pathInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') doScan(pat
   dropzone.addEventListener(evt, (e) => { e.preventDefault(); dropzone.classList.remove('dragover'); })
 );
 dropzone.addEventListener('drop', (e) => {
-  const item = e.dataTransfer.items && e.dataTransfer.items[0];
-  const file = e.dataTransfer.files && e.dataTransfer.files[0];
   // Browsers do not expose a real filesystem path from drag-and-drop for
   // security reasons, so we can't act on it directly here. Guide the user
   // to the reliable option instead.
-  setupMessage.textContent = 'Browsers hide the real folder path on drag-and-drop — ' +
-    'please use "Browse for folder…" or paste the path below.';
+  introMessage.textContent = 'Browsers hide the real disk path on drag-and-drop — ' +
+    'please use one of the Browse buttons above, or paste the path below.';
 });
+
+async function goToModeScreen() {
+  if (introNextBtn.disabled) return;
+  introNextBtn.disabled = true;
+  const idle = introNextBtn.textContent;
+  introNextBtn.textContent = 'Scanning…';
+  const ok = await doScan(pathInput.value);
+  introNextBtn.disabled = false;
+  introNextBtn.textContent = idle;
+  if (!ok) return;
+
+  modeMessage.textContent = '';
+  modeLocation.textContent = scanFolder || pathInput.value.trim();
+  if (scannedVideos.length === 1) {
+    modeHeading.textContent = '1 video selected';
+  } else {
+    modeHeading.textContent = `${scannedVideos.length} video files found`;
+  }
+  renderScanList();
+  showScreen(modeScreen);
+}
 
 function updateSnapshotInterval() {
   const n = clampSnapshotCount(parseInt(snapshotCountInput.value, 10) || 20);
@@ -412,6 +568,11 @@ function applyLoadedSettings() {
   if (reviewSpeedCountInput) reviewSpeedCountInput.value = loadedSpeed;
   syncSpeedPresets(loadedSpeed);
 
+  const shots = clampCompilationShots(currentSettings.compilation_shots || 9);
+  if (compilationShotsSlider) compilationShotsSlider.value = shots;
+  if (reviewCompilationSlider) reviewCompilationSlider.value = shots;
+  updateCompilationLabels(shots);
+
   renderSettingsEditor(currentSettings);
   renderLegend(currentSettings);
 }
@@ -419,6 +580,7 @@ function applyLoadedSettings() {
 function renderSettingsEditor(settings) {
   deleteKeyInput.value = settings.delete_key.toUpperCase();
   keepKeyInput.value = settings.keep_key.toUpperCase();
+  if (compileKeyInput) compileKeyInput.value = (settings.compile_key || 'c').toUpperCase();
   sortButtonsList.innerHTML = '';
   settings.sort_buttons.forEach(b => sortButtonsList.appendChild(buildSortButtonRow(b)));
 }
@@ -459,7 +621,9 @@ function collectSettingsFromEditor() {
   return {
     delete_key: deleteKeyInput.value.trim() || 'd',
     keep_key: keepKeyInput.value.trim() || 'k',
+    compile_key: (compileKeyInput ? compileKeyInput.value.trim() : '') || 'c',
     default_num_snapshots: currentSettings ? currentSettings.default_num_snapshots : 20,
+    compilation_shots: currentSettings ? currentSettings.compilation_shots : 9,
     sort_buttons: sortButtons,
   };
 }
@@ -470,7 +634,7 @@ saveSettingsBtn.addEventListener('click', async () => {
   const proposed = collectSettingsFromEditor();
 
   // quick client-side uniqueness check before hitting the server
-  const keys = [proposed.delete_key, proposed.keep_key, ...proposed.sort_buttons.map(b => b.key)]
+  const keys = [proposed.delete_key, proposed.keep_key, proposed.compile_key, ...proposed.sort_buttons.map(b => b.key)]
     .map(k => k.toLowerCase());
   const hasDupes = new Set(keys).size !== keys.length;
   if (hasDupes) {
@@ -510,6 +674,7 @@ resetSettingsBtn.addEventListener('click', () => {
 function renderLegend(settings) {
   let html = `<li><kbd>${escapeHtml(settings.delete_key.toUpperCase())}</kbd><span>Delete file <em>(sent to Recycle Bin / Trash)</em></span></li>`;
   html += `<li><kbd>${escapeHtml(settings.keep_key.toUpperCase())}</kbd><span>Keep <em>(leave in place, no changes)</em></span></li>`;
+  html += `<li><kbd>${escapeHtml((settings.compile_key || 'c').toUpperCase())}</kbd><span>Save screenshot compilation <em>(grid image next to the file, then moves on)</em></span></li>`;
   html += `<li><kbd>Esc</kbd><span>Skip <em>(move on, no changes — for stuck/broken videos)</em></span></li>`;
   html += `<li><kbd>⌫</kbd><span>Undo <em>(reverse the previous action and go back)</em></span></li>`;
   html += `<li><span style="width:26px;text-align:center;color:var(--text-dim);font-size:11px;">auto</span><span>Unreadable files are skipped automatically <em>(listed below)</em></span></li>`;
@@ -517,26 +682,29 @@ function renderLegend(settings) {
     html += `<li><kbd>${escapeHtml(b.key.toUpperCase())}</kbd><span>Move to subfolder <b>/${escapeHtml(b.folder)}</b></span></li>`;
   });
   keyLegend.innerHTML = html;
+  if (compileKeyKbd) compileKeyKbd.textContent = (settings.compile_key || 'c').toUpperCase();
 }
 
 function buildKeyActionMap(settings) {
   const map = {};
   map[settings.delete_key.toLowerCase()] = 'delete';
   map[settings.keep_key.toLowerCase()] = 'keep';
+  map[(settings.compile_key || 'c').toLowerCase()] = 'compile';
   settings.sort_buttons.forEach(b => { map[b.key.toLowerCase()] = b.id; });
   return map;
 }
 
 loadSettings();
 
+let scanFolder = null; // the resolved base folder returned by /api/scan (parent dir for a single file)
+
 async function doScan(path) {
   path = (path || '').trim();
   if (!path) {
-    setupMessage.textContent = 'Choose or paste a folder path first.';
+    introMessage.textContent = 'Choose or paste a folder or video file path first.';
     return false;
   }
-  setupMessage.textContent = '';
-  scanResults.classList.add('hidden');
+  introMessage.textContent = '';
 
   const numSnapshots = clampSnapshotCount(parseInt(snapshotCountInput.value, 10) || 20);
 
@@ -548,7 +716,7 @@ async function doScan(path) {
     });
     const data = await res.json();
     if (!data.success) {
-      setupMessage.textContent = data.error || 'Could not scan that folder.';
+      introMessage.textContent = data.error || 'Could not scan that path.';
       return false;
     }
     NUM_SNAPSHOTS = data.num_snapshots || numSnapshots;
@@ -558,18 +726,15 @@ async function doScan(path) {
       renderLegend(currentSettings);
     }
     scannedVideos = data.videos;
+    scanFolder = data.folder || null;
     if (data.count === 0) {
-      setupMessage.textContent = 'No supported video files were found in that folder.';
+      introMessage.textContent = 'No supported video files were found there.';
       return false;
     }
-    scanCount.textContent = `${data.count} video file${data.count === 1 ? '' : 's'} found`;
-    scanList.innerHTML = scannedVideos.map(v =>
-      `<li><span class="fname">${escapeHtml(v.filename)}</span><span class="fsize">${fmtSize(v.size)}</span></li>`
-    ).join('');
-    scanResults.classList.remove('hidden');
+    deselectedVideoIds = new Set();
     return true;
   } catch (e) {
-    setupMessage.textContent = 'Could not reach the local server.';
+    introMessage.textContent = 'Could not reach the local server.';
     return false;
   }
 }
@@ -579,6 +744,83 @@ function escapeHtml(s) {
   d.textContent = s;
   return d.innerHTML;
 }
+
+/* ---------------- Scan results: deselecting individual files ---------------- */
+
+const scanSelectAll = document.getElementById('scan-select-all');
+const scanSelectedCount = document.getElementById('scan-selected-count');
+
+function renderScanList() {
+  scanList.innerHTML = scannedVideos.map(v => {
+    const checked = deselectedVideoIds.has(v.id) ? '' : 'checked';
+    const cls = deselectedVideoIds.has(v.id) ? 'deselected' : '';
+    return `<li class="${cls}" data-id="${escapeAttr(v.id)}">
+      <label class="scan-item">
+        <input type="checkbox" class="scan-item-checkbox" ${checked}>
+        <span class="fname">${escapeHtml(v.filename)}</span>
+      </label>
+      <span class="fsize">${fmtSize(v.size)}</span>
+    </li>`;
+  }).join('');
+  updateScanSelectedCount();
+}
+
+function updateScanSelectedCount() {
+  const total = scannedVideos.length;
+  const selected = total - deselectedVideoIds.size;
+  if (scanSelectedCount) {
+    scanSelectedCount.textContent = deselectedVideoIds.size
+      ? `${selected} of ${total} selected`
+      : '';
+  }
+  if (scanSelectAll) scanSelectAll.checked = deselectedVideoIds.size === 0;
+}
+
+scanList.addEventListener('change', (e) => {
+  const checkbox = e.target.closest('.scan-item-checkbox');
+  if (!checkbox) return;
+  const li = e.target.closest('li[data-id]');
+  const id = li.dataset.id;
+  if (checkbox.checked) {
+    deselectedVideoIds.delete(id);
+    li.classList.remove('deselected');
+  } else {
+    deselectedVideoIds.add(id);
+    li.classList.add('deselected');
+  }
+  updateScanSelectedCount();
+});
+
+if (scanSelectAll) {
+  scanSelectAll.addEventListener('change', () => {
+    deselectedVideoIds = scanSelectAll.checked ? new Set() : new Set(scannedVideos.map(v => v.id));
+    renderScanList();
+  });
+}
+
+/* ---------------- Mode screen: choose review vs. compile ---------------- */
+
+modeBackBtn.addEventListener('click', () => {
+  introMessage.textContent = '';
+  showScreen(introScreen);
+});
+
+optionReviewBtn.addEventListener('click', () => {
+  showScreen(reviewSettingsScreen);
+});
+
+optionCompileBtn.addEventListener('click', () => {
+  compileSettingsMessage.textContent = '';
+  showScreen(compileSettingsScreen);
+});
+
+reviewSettingsBackBtn.addEventListener('click', () => {
+  showScreen(modeScreen);
+});
+
+compileSettingsBackBtn.addEventListener('click', () => {
+  showScreen(modeScreen);
+});
 
 /* ---------------- Prepare mode: pre-cache snapshots ahead of time ---------------- */
 
@@ -598,9 +840,6 @@ let preparingForReview = false; // true while the setup-screen "Prepare" panel i
 const startBtnIdleLabel = startBtn.textContent;
 
 function setFolderControlsDisabled(disabled) {
-  browseBtn.disabled = disabled;
-  pathInput.disabled = disabled;
-  scanBtn.disabled = disabled;
   // Only one prepare job can run on the backend at a time — keep the other
   // two panels' buttons disabled too so a click there can't silently fail
   // (or, worse, target a different folder while this one is still running).
@@ -627,15 +866,9 @@ function wirePreparePanel(panel) {
     panel.btn.textContent = 'Starting…';
 
     if (panel.autoReview) {
-      // Make sure the folder is actually scanned (sets up the video queue
-      // this session will review) before we start caching its snapshots.
-      setupMessage.textContent = '';
-      const scanned = await doScan(path);
-      if (!scanned) {
-        panel.btn.disabled = false;
-        panel.btn.textContent = panel.idleLabel;
-        return; // doScan() already reported the error/empty-folder message
-      }
+      // The folder/file was already scanned back on the intro screen (that's
+      // how we got to this settings screen at all) — no need to scan again,
+      // which would also wipe out any files deselected on the mode screen.
       preparingForReview = true;
       startBtn.disabled = true;
       startBtn.textContent = 'Preparing snapshots…';
@@ -768,9 +1001,179 @@ function onPrepareFinished(data) {
   }
 }
 
-function enterReviewScreen() {
-  setupScreen.classList.add('hidden');
-  reviewScreen.classList.remove('hidden');
+/* ---------------- Batch screenshot compilation (settings + progress screens) ---------------- */
+
+let compileBatchPollTimer = null;
+const compileStartIdleLabel = compileStartBtn ? compileStartBtn.textContent : '';
+
+function getExcludedIdsForBatch() {
+  return Array.from(deselectedVideoIds);
+}
+
+if (compileOutputBrowseBtn) {
+  compileOutputBrowseBtn.addEventListener('click', async () => {
+    compileSettingsMessage.textContent = '';
+    compileOutputBrowseBtn.disabled = true;
+    try {
+      const res = await fetch('/api/browse', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: 'output' }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        compileOutputInput.value = data.path;
+      } else if (data.error && data.error !== 'Nothing selected') {
+        compileSettingsMessage.textContent = data.error;
+      }
+    } catch (e) {
+      compileSettingsMessage.textContent = 'Could not reach the local server.';
+    }
+    compileOutputBrowseBtn.disabled = false;
+  });
+}
+
+if (compileStartBtn) {
+  compileStartBtn.addEventListener('click', async () => {
+    const path = (pathInput.value || '').trim();
+    if (!path) {
+      compileSettingsMessage.textContent = 'Choose or paste a folder or video file path first.';
+      return;
+    }
+
+    compileSettingsMessage.textContent = '';
+    compileStartBtn.disabled = true;
+    compileStartBtn.textContent = 'Starting…';
+
+    try {
+      const res = await fetch('/api/compile_batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          path,
+          num_shots: getCompilationShots(),
+          excluded_ids: getExcludedIdsForBatch(),
+          output_dir: (compileOutputInput.value || '').trim(),
+        }),
+      });
+      const data = await res.json();
+      if (!data.success) {
+        compileSettingsMessage.textContent = data.error || 'Could not start creating compilations for that folder.';
+        compileStartBtn.disabled = false;
+        compileStartBtn.textContent = compileStartIdleLabel;
+        return;
+      }
+      compileStartBtn.disabled = false;
+      compileStartBtn.textContent = compileStartIdleLabel;
+
+      compileProgressSubtitle.textContent = `${data.total} video${data.total === 1 ? '' : 's'} · ${data.num_shots} screenshots each`;
+      compileBatchFill.style.width = '0%';
+      compileBatchProgressLabel.textContent = `0 / ${data.total} · 0%`;
+      compileFileList.innerHTML = '';
+      compileBatchMessage.style.color = '';
+      compileBatchMessage.textContent = '';
+      compileBatchCancelBtn.disabled = false;
+      compileBatchDoneBtn.classList.add('hidden');
+      showScreen(compileProgressScreen);
+      pollCompileBatchStatus();
+    } catch (e) {
+      compileSettingsMessage.textContent = 'Could not reach the local server.';
+      compileStartBtn.disabled = false;
+      compileStartBtn.textContent = compileStartIdleLabel;
+    }
+  });
+
+  compileBatchCancelBtn.addEventListener('click', async () => {
+    compileBatchCancelBtn.disabled = true;
+    try {
+      await fetch('/api/compile_batch/cancel', { method: 'POST' });
+    } catch (e) {
+      compileBatchCancelBtn.disabled = false;
+    }
+  });
+
+  compileBatchDoneBtn.addEventListener('click', () => location.reload());
+}
+
+function pollCompileBatchStatus() {
+  if (compileBatchPollTimer) clearInterval(compileBatchPollTimer);
+  compileBatchPollTimer = setInterval(async () => {
+    try {
+      const res = await fetch('/api/compile_batch/status');
+      const data = await res.json();
+      renderCompileBatchStatus(data);
+      if (!data.running) {
+        clearInterval(compileBatchPollTimer);
+        compileBatchPollTimer = null;
+        onCompileBatchFinished(data);
+      }
+    } catch (e) {
+      // transient fetch error — keep polling rather than giving up
+    }
+  }, 700);
+}
+
+const COMPILE_FILE_BADGE = {
+  pending: 'PENDING',
+  processing: 'WORKING…',
+  done: 'DONE',
+  failed: 'FAILED',
+};
+
+function renderCompileBatchStatus(data) {
+  const total = data.total_videos || 0;
+  const done = data.done_videos || 0;
+  const pct = total ? Math.round((done / total) * 100) : 0;
+  compileBatchFill.style.width = pct + '%';
+  compileBatchProgressLabel.textContent = `${done} / ${total} · ${pct}%`;
+  compileProgressSubtitle.textContent = data.running
+    ? `Working on: ${data.current_filename || '…'}`
+    : `${done} / ${total} video${total === 1 ? '' : 's'} processed`;
+
+  const videos = data.videos || [];
+  compileFileList.innerHTML = videos.map(v => {
+    const active = v.id === data.current_id ? 'active' : '';
+    return `<li class="${active}">
+      <span class="badge ${v.status}">${COMPILE_FILE_BADGE[v.status] || v.status.toUpperCase()}</span>
+      <span class="fname">${escapeHtml(v.filename)}</span>
+    </li>`;
+  }).join('');
+}
+
+function onCompileBatchFinished(data) {
+  compileBatchCancelBtn.disabled = true;
+  compileBatchDoneBtn.classList.remove('hidden');
+  compileBatchMessage.style.color = '';
+
+  if (data.error) {
+    compileBatchMessage.textContent = `Stopped early: ${data.error}`;
+    return;
+  }
+  if (data.cancelled) {
+    compileBatchMessage.textContent = `Cancelled — ${data.done_videos} video${data.done_videos === 1 ? '' : 's'} were already compiled before stopping.`;
+    return;
+  }
+  let msg = `Done — ${data.done_videos} video${data.done_videos === 1 ? '' : 's'} processed.`;
+  if (data.failed && data.failed.length) {
+    msg += ` ${data.failed.length} file${data.failed.length === 1 ? '' : 's'} could not be compiled.`;
+  }
+  compileBatchMessage.style.color = 'var(--success)';
+  compileBatchMessage.textContent = msg;
+}
+
+async function enterReviewScreen() {
+  if (deselectedVideoIds.size) {
+    try {
+      await fetch('/api/exclude', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: Array.from(deselectedVideoIds) }),
+      });
+    } catch (e) {
+      // non-critical — worst case the deselected files still show up in the queue
+    }
+  }
+  showScreen(reviewScreen);
   refreshStatus();
 }
 
@@ -831,8 +1234,7 @@ async function refreshStatus() {
   }
 
   // In case we just undid our way back from the Done screen.
-  doneScreen.classList.add('hidden');
-  reviewScreen.classList.remove('hidden');
+  showScreen(reviewScreen);
 
   const next = data.videos[data.current_index];
   if (!next) return;
@@ -866,7 +1268,7 @@ function renderQueue(data) {
   queueList.innerHTML = data.videos.map((v, i) => {
     const active = i === data.current_index ? 'active' : '';
     const badgeText = v.status === 'moved' ? `→ ${v.destination}` :
-      { pending: 'PENDING', deleted: 'DELETED', kept: 'KEPT', skipped: 'SKIPPED', auto_skipped: 'UNREADABLE' }[v.status] || v.status.toUpperCase();
+      { pending: 'PENDING', deleted: 'DELETED', kept: 'KEPT', compiled: 'COMPILED', skipped: 'SKIPPED', auto_skipped: 'UNREADABLE' }[v.status] || v.status.toUpperCase();
     return `<li class="${active}">
       <span class="badge ${v.status}">${escapeHtml(badgeText)}</span>
       <span class="fname">${escapeHtml(v.filename)}</span>
@@ -996,8 +1398,7 @@ frameScrubber.addEventListener('change', () => {
 function showDone(data) {
   stopSlideshow();
   stopBrokenPoll();
-  reviewScreen.classList.add('hidden');
-  doneScreen.classList.remove('hidden');
+  showScreen(doneScreen);
   const counts = {};
   data.videos.forEach(v => {
     const key = v.status === 'moved' ? `moved to /${v.destination}` : v.status;
@@ -1010,11 +1411,13 @@ function showDone(data) {
 async function performAction(act) {
   if (busy || undoing || !currentVideo) return;
   busy = true;
+  const body = { id: currentVideo.id, action: act };
+  if (act === 'compile') body.num_shots = getCompilationShots();
   try {
     const res = await fetch('/api/action', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: currentVideo.id, action: act }),
+      body: JSON.stringify(body),
     });
     const data = await res.json();
     if (data.success) {
@@ -1024,6 +1427,8 @@ async function performAction(act) {
       loadToken++; // invalidate any in-flight thumbnail loads for the video we just left
       currentVideo = null; // force next video to load
       await refreshStatus();
+    } else if (act === 'compile' && data.error) {
+      alert(data.error);
     }
   } finally {
     busy = false;
@@ -1031,6 +1436,7 @@ async function performAction(act) {
 }
 
 skipBtn.addEventListener('click', () => performAction('skip'));
+if (compileBtn) compileBtn.addEventListener('click', () => performAction('compile'));
 
 let undoing = false; // guard against double-firing, same idea as `busy` for performAction
 

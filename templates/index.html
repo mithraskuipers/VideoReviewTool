@@ -10,27 +10,91 @@
 
 <div class="app">
 
-  <!-- ===================== SETUP SCREEN ===================== -->
-  <section id="setup-screen" class="screen">
+  <!-- ===================== STEP 1: INTRO / SELECT INPUT ===================== -->
+  <section id="intro-screen" class="screen">
     <div class="setup-card">
       <div class="brand">
         <span class="brand-mark">▤</span>
         <div>
           <h1>VideoReviewTool</h1>
-          <p class="subtitle">Skim, sort and clean a folder of video files in seconds.</p>
+          <p class="subtitle">Skim, sort and clean videos in seconds — or turn each one into a quick screenshot-grid preview.</p>
         </div>
       </div>
 
+      <p class="intro-lead">
+        Point this at a single video file or a whole folder of them to get started.
+        On the next screen you'll choose whether to review them one by one, or generate
+        a screenshot compilation image for each.
+      </p>
+
       <div id="dropzone" class="dropzone">
-        <p class="dropzone-title">Drop a folder here</p>
+        <p class="dropzone-title">Drop a video file or folder here</p>
         <p class="dropzone-hint">Browsers can't read a real disk path from a drag-and-drop action,
-          so use the button below to choose the folder reliably — or paste the path directly.</p>
-        <button id="browse-btn" class="btn btn-primary">Browse for folder…</button>
+          so use one of the buttons below to choose reliably — or paste the path directly.</p>
+        <div class="dropzone-buttons">
+          <button id="browse-folder-btn" class="btn btn-primary">Browse for a folder…</button>
+          <button id="browse-file-btn" class="btn btn-secondary">Browse for a single file…</button>
+        </div>
       </div>
 
       <div class="path-row">
-        <input id="path-input" type="text" placeholder="Or paste a folder path, e.g. C:\Videos\Inbox" />
-        <button id="scan-btn" class="btn btn-secondary">Scan folder</button>
+        <input id="path-input" type="text" placeholder="Or paste a folder or video file path, e.g. C:\Videos\Inbox" />
+      </div>
+
+      <p id="intro-message" class="message"></p>
+
+      <button id="intro-next-btn" class="btn btn-primary btn-large">Next →</button>
+
+      <p class="footnote">Supported formats: .mp4, .avi, .mov, .mkv, .webm, .flv, .wmv, .m4v, .mpg, .mpeg, .ts</p>
+    </div>
+  </section>
+
+  <!-- ===================== STEP 2: CHOOSE WHAT TO DO ===================== -->
+  <section id="mode-screen" class="screen hidden">
+    <div class="setup-card">
+      <div class="brand">
+        <span class="brand-mark small">▤</span>
+        <div>
+          <h1 id="mode-heading">Videos found</h1>
+          <p class="subtitle" id="mode-location">—</p>
+        </div>
+      </div>
+
+      <div class="scan-select-row">
+        <label><input type="checkbox" id="scan-select-all" checked> Select all</label>
+        <span id="scan-selected-count" class="footnote" style="margin:0;"></span>
+      </div>
+      <ul id="scan-list" class="scan-list"></ul>
+
+      <p class="mode-prompt">What would you like to do with the selected file(s)?</p>
+
+      <div class="option-cards">
+        <button id="option-review-btn" class="option-card">
+          <span class="option-card-icon">▶</span>
+          <span class="option-card-title">Start reviewing</span>
+          <span class="option-card-desc">Skim each video as a slideshow and Delete / Keep / Sort with single key presses.</span>
+        </button>
+        <button id="option-compile-btn" class="option-card">
+          <span class="option-card-icon">🖼</span>
+          <span class="option-card-title">Create screenshot compilations</span>
+          <span class="option-card-desc">Generate a single grid image of evenly-spaced screenshots for each video.</span>
+        </button>
+      </div>
+
+      <button id="mode-back-btn" class="btn btn-secondary">← Back</button>
+      <p id="mode-message" class="message"></p>
+    </div>
+  </section>
+
+  <!-- ===================== STEP 3A: REVIEW SETTINGS ===================== -->
+  <section id="review-settings-screen" class="screen hidden">
+    <div class="setup-card">
+      <div class="brand">
+        <span class="brand-mark small">▶</span>
+        <div>
+          <h1>Start reviewing</h1>
+          <p class="subtitle">Choose how each video previews, then dive in.</p>
+        </div>
       </div>
 
       <div class="snapshot-row">
@@ -99,6 +163,11 @@
           <span class="settings-row-label">Keep</span>
           <span class="settings-row-desc">leaves the file where it is, no changes</span>
         </div>
+        <div class="settings-row settings-row-fixed">
+          <input type="text" id="compile-key-input" class="key-input" maxlength="1" value="C">
+          <span class="settings-row-label">Compile</span>
+          <span class="settings-row-desc">saves a screenshot-grid image next to the file, then moves on</span>
+        </div>
 
         <div id="sort-buttons-list" class="sort-buttons-list"></div>
 
@@ -113,13 +182,77 @@
 
       <p id="setup-message" class="message"></p>
 
-      <div id="scan-results" class="scan-results hidden">
-        <h2 id="scan-count"></h2>
-        <ul id="scan-list" class="scan-list"></ul>
+      <div class="step-actions">
+        <button id="review-settings-back-btn" class="btn btn-secondary">← Back</button>
         <button id="start-btn" class="btn btn-primary btn-large">Start reviewing →</button>
       </div>
+    </div>
+  </section>
 
-      <p class="footnote">Supported formats: .mp4, .avi, .mov, .mkv, .webm, .flv, .wmv, .m4v, .mpg, .mpeg, .ts</p>
+  <!-- ===================== STEP 3B: COMPILATION SETTINGS ===================== -->
+  <section id="compile-settings-screen" class="screen hidden">
+    <div class="setup-card">
+      <div class="brand">
+        <span class="brand-mark small">🖼</span>
+        <div>
+          <h1>Create screenshot compilations</h1>
+          <p class="subtitle">One grid image per video, saved automatically.</p>
+        </div>
+      </div>
+
+      <div class="slider-row">
+        <label for="compilation-shots-slider">Screenshots per compilation image</label>
+        <div class="slider-controls">
+          <input type="range" id="compilation-shots-slider" min="4" max="64" step="1" value="9">
+          <span id="compilation-shots-value" class="snapshot-interval">9 (3 × 3 · every 11%)</span>
+        </div>
+      </div>
+
+      <div class="path-row" style="margin-top:14px;">
+        <input id="compile-output-input" type="text" placeholder="Output folder (default: same folder as each video)" />
+        <button id="compile-output-browse-btn" class="btn btn-secondary">Browse…</button>
+      </div>
+      <p class="dropzone-hint" style="margin:6px 0 0;">
+        Each image is saved as <code>&lt;filename&gt;_screenshot_overview.jpg</code>. Leave the output folder
+        blank to save each compilation right next to its source video. The individual frames used to
+        build the grid are never written to disk on their own.
+      </p>
+
+      <p id="compile-settings-message" class="message"></p>
+
+      <div class="step-actions">
+        <button id="compile-settings-back-btn" class="btn btn-secondary">← Back</button>
+        <button id="compile-start-btn" class="btn btn-primary btn-large">Start creating compilations →</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== STEP 3B-2: COMPILATION PROGRESS ===================== -->
+  <section id="compile-progress-screen" class="screen hidden">
+    <div class="setup-card">
+      <div class="brand">
+        <span class="brand-mark small">🖼</span>
+        <div>
+          <h1>Creating screenshot compilations</h1>
+          <p class="subtitle" id="compile-progress-subtitle">—</p>
+        </div>
+      </div>
+
+      <div class="progress-wrap" style="width:100%; margin-bottom:14px;">
+        <div class="progress-track">
+          <div id="compile-batch-progress-fill" class="progress-fill" style="width:0%"></div>
+        </div>
+        <span id="compile-batch-progress-label" class="progress-label">0 / 0 · 0%</span>
+      </div>
+
+      <ul id="compile-file-list" class="queue-list compile-file-list"></ul>
+
+      <p id="compile-batch-message" class="message"></p>
+
+      <div class="step-actions">
+        <button id="compile-batch-cancel-btn" class="btn btn-secondary" disabled>Cancel</button>
+        <button id="compile-batch-done-btn" class="btn btn-primary hidden">Done — start over</button>
+      </div>
     </div>
   </section>
 
@@ -168,6 +301,9 @@
           <button id="undo-btn" class="btn btn-secondary" title="Undo the previous action" disabled>
             ↶ Undo last action <kbd style="margin-left:6px;">⌫</kbd>
           </button>
+          <button id="compile-btn" class="btn btn-secondary" title="Save a screenshot-grid image for this video next to it, then move on">
+            🖼 Save compilation <kbd style="margin-left:6px;" id="compile-key-kbd">C</kbd>
+          </button>
           <button id="skip-btn" class="btn btn-secondary" title="Move on without deleting, keeping, or moving this file">
             Skip this video <kbd style="margin-left:6px;">Esc</kbd>
           </button>
@@ -208,6 +344,17 @@
                 <input id="review-speed-count" type="number" min="50" max="3000" step="10" value="225" />
               </div>
               <span id="review-speed-label" class="snapshot-interval">225 ms/frame</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h3>Screenshot compilation</h3>
+          <div class="playback-row">
+            <label for="review-compilation-slider">Screenshots per compilation image</label>
+            <div class="slider-controls">
+              <input type="range" id="review-compilation-slider" min="4" max="64" step="1" value="9">
+              <span id="review-compilation-value" class="snapshot-interval">9 (3 × 3 · every 11%)</span>
             </div>
           </div>
         </div>
