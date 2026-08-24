@@ -1,23 +1,71 @@
 #!/usr/bin/env bash
 set -e
+
 cd "$(dirname "$0")"
 
-if ! command -v python3 &> /dev/null; then
-    echo "Python 3 was not found. Install it with your package manager, e.g.:"
+echo "Starting VideoReviewTool..."
+echo
+
+# Check Python
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "ERROR: Python 3 was not found."
+    echo
+    echo "Install it with:"
     echo "  sudo apt install python3 python3-venv python3-tk"
+    echo
+    read -p "Press Enter to exit..."
     exit 1
 fi
 
-if [ ! -d ".venv" ]; then
+echo "Python version:"
+python3 --version
+echo
+
+# Create or repair virtual environment
+if [ ! -f ".venv/bin/activate" ]; then
+    echo "Python virtual environment is missing or incomplete."
+
+    if [ -d ".venv" ]; then
+        echo "Removing broken virtual environment..."
+        rm -rf ".venv"
+    fi
+
     echo "Creating virtual environment..."
     python3 -m venv .venv
+
+    if [ ! -f ".venv/bin/activate" ]; then
+        echo
+        echo "ERROR: Failed to create the virtual environment."
+        echo
+        echo "Please install the required Python packages:"
+        echo "  sudo apt install python3-venv python3-tk"
+        echo
+        read -p "Press Enter to exit..."
+        exit 1
+    fi
+
+    echo "Virtual environment created."
 fi
 
-source .venv/bin/activate
+# Activate virtual environment
+echo "Activating virtual environment..."
+source ".venv/bin/activate"
 
+echo
 echo "Checking dependencies..."
-pip install --quiet --upgrade pip
-pip install --quiet -r requirements.txt
 
+# Upgrade pip
+python -m pip install --quiet --upgrade pip
+
+# Install dependencies
+python -m pip install --quiet -r requirements.txt
+
+echo
 echo "Starting VideoReviewTool..."
+echo
+
 python app.py
+
+echo
+echo "VideoReviewTool has exited."
+read -p "Press Enter to exit..."
