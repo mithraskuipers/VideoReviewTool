@@ -32,6 +32,8 @@ const modeMessage = document.getElementById('mode-message');
 const optionReviewBtn = document.getElementById('option-review-btn');
 const optionCompileBtn = document.getElementById('option-compile-btn');
 const optionOverviewBtn = document.getElementById('option-overview-btn');
+const optionVideoBtn = document.getElementById('option-video-btn');
+const previewVideo = document.getElementById('preview-video');
 const scanList = document.getElementById('scan-list');
 
 const reviewSettingsBackBtn = document.getElementById('review-settings-back-btn');
@@ -135,7 +137,7 @@ const doneSummary = document.getElementById('done-summary');
 
 let scannedVideos = [];
 let deselectedVideoIds = new Set(); // ids the person unchecked in the scan-results list
-let reviewMode = 'thumbnails'; // 'thumbnails' (live slideshow) or 'overview' (static screenshot-overview image)
+let reviewMode = 'thumbnails'; // 'thumbnails' (live slideshow), 'overview' (static screenshot-overview image) or 'video' (plain playback)
 let slideshowTimer = null;
 let slideshowIdx = 0;
 let currentVideo = null;
@@ -145,6 +147,9 @@ let loadToken = 0; // bumped every time loadPreview() starts, so late-arriving i
                     // loads for a video the user already skipped/actioned past are ignored
 let brokenPollTimer = null; // polls while a video is loading to catch the backend
                              // flagging it unreadable, so we can auto-skip quickly
+
+const VIDEO_SEEK_SECONDS = 5;
+const VIDEO_SEEK_SECONDS_LONG = 30;
 
 const DEFAULT_SETTINGS = {
   delete_key: 'd',
@@ -190,6 +195,7 @@ const overviewReviewBtn = document.getElementById('overview-review-btn');
 const overviewReviewDesc = document.getElementById('overview-review-desc');
 const overviewGenerateBtn = document.getElementById('overview-generate-btn');
 const overviewGenerateDesc = document.getElementById('overview-generate-desc');
+const overviewVideoBtn = document.getElementById('overview-video-btn');
 const overviewBackBtn = document.getElementById('overview-back-btn');
 const overviewMessage = document.getElementById('overview-message');
 
@@ -229,7 +235,7 @@ async function saveCompilationShots(n) {
     });
     if (currentSettings) currentSettings.compilation_shots = n;
   } catch (e) {
-    // non-critical — the chosen value still works for this session
+    // non-critical - the chosen value still works for this session
   }
 }
 
@@ -337,7 +343,7 @@ dropzone.addEventListener('drop', (e) => {
   // Browsers do not expose a real filesystem path from drag-and-drop for
   // security reasons, so we can't act on it directly here. Guide the user
   // to the reliable option instead.
-  introMessage.textContent = 'Browsers hide the real disk path on drag-and-drop — ' +
+  introMessage.textContent = 'Browsers hide the real disk path on drag-and-drop - ' +
     'please use one of the Browse buttons above, or paste the path below.';
 });
 
@@ -436,7 +442,7 @@ async function commitReviewSnapshotCount(n) {
 
     if (currentVideo) loadPreview(currentVideo); // re-fetch thumbnails at the new count
   } catch (e) {
-    // non-critical — the old count keeps working for this session
+    // non-critical - the old count keeps working for this session
   }
 }
 
@@ -490,7 +496,7 @@ function applySpeedLive(ms) {
   if (slideshowTimer) restartSlideshowTimer(); // apply live if a slideshow is currently playing
 }
 
-// Normalizes both fields, updates both presets, and persists — used on blur/enter/preset-select.
+// Normalizes both fields, updates both presets, and persists - used on blur/enter/preset-select.
 function commitSpeed(ms) {
   ms = clampSpeed(ms);
   applySpeedLive(ms);
@@ -509,7 +515,7 @@ async function saveSpeed(ms) {
     });
     if (currentSettings) currentSettings.slideshow_interval_ms = ms;
   } catch (e) {
-    // non-critical — speed still works for this session even if it can't be saved
+    // non-critical - speed still works for this session even if it can't be saved
   }
 }
 
@@ -662,7 +668,7 @@ saveSettingsBtn.addEventListener('click', async () => {
     .map(k => k.toLowerCase());
   const hasDupes = new Set(keys).size !== keys.length;
   if (hasDupes) {
-    settingsMessage.textContent = 'Each key can only be used once — check for duplicates.';
+    settingsMessage.textContent = 'Each key can only be used once - check for duplicates.';
     return;
   }
 
@@ -681,7 +687,7 @@ saveSettingsBtn.addEventListener('click', async () => {
     renderSettingsEditor(currentSettings);
     renderLegend(currentSettings);
     settingsMessage.style.color = 'var(--success)';
-    settingsMessage.textContent = 'Saved — these buttons will be remembered next time too.';
+    settingsMessage.textContent = 'Saved - these buttons will be remembered next time too.';
   } catch (e) {
     settingsMessage.textContent = 'Could not reach the local server.';
   }
@@ -692,15 +698,20 @@ resetSettingsBtn.addEventListener('click', () => {
   defaults.default_num_snapshots = currentSettings ? currentSettings.default_num_snapshots : 20;
   renderSettingsEditor(defaults);
   settingsMessage.style.color = '';
-  settingsMessage.textContent = 'Defaults loaded — click "Save settings" to keep them.';
+  settingsMessage.textContent = 'Defaults loaded - click "Save settings" to keep them.';
 });
 
 function renderLegend(settings) {
   let html = `<li><kbd>${escapeHtml(settings.delete_key.toUpperCase())}</kbd><span>Delete file <em>(sent to Recycle Bin / Trash)</em></span></li>`;
   html += `<li><kbd>${escapeHtml(settings.keep_key.toUpperCase())}</kbd><span>Keep <em>(leave in place, no changes)</em></span></li>`;
   html += `<li><kbd>${escapeHtml((settings.compile_key || 'c').toUpperCase())}</kbd><span>Save screenshot compilation <em>(grid image next to the file, then moves on)</em></span></li>`;
-  html += `<li><kbd>Esc</kbd><span>Skip <em>(move on, no changes — for stuck/broken videos)</em></span></li>`;
+  html += `<li><kbd>Esc</kbd><span>Skip <em>(move on, no changes - for stuck/broken videos)</em></span></li>`;
   html += `<li><kbd>⌫</kbd><span>Undo <em>(reverse the previous action and go back)</em></span></li>`;
+  if (reviewMode === 'video') {
+    html += `<li><kbd>←</kbd><span>Rewind <em>(${VIDEO_SEEK_SECONDS}s, hold Shift for ${VIDEO_SEEK_SECONDS_LONG}s)</em></span></li>`;
+    html += `<li><kbd>→</kbd><span>Fast-forward <em>(${VIDEO_SEEK_SECONDS}s, hold Shift for ${VIDEO_SEEK_SECONDS_LONG}s)</em></span></li>`;
+    html += `<li><kbd>␣</kbd><span>Play / pause</span></li>`;
+  }
   html += `<li><span style="width:26px;text-align:center;color:var(--text-dim);font-size:11px;">auto</span><span>Unreadable files are skipped automatically <em>(listed below)</em></span></li>`;
   settings.sort_buttons.forEach(b => {
     html += `<li><kbd>${escapeHtml(b.key.toUpperCase())}</kbd><span>Move to subfolder <b>/${escapeHtml(b.folder)}</b></span></li>`;
@@ -721,7 +732,7 @@ function buildKeyActionMap(settings) {
 loadSettings();
 
 let scanFolder = null; // the resolved base folder returned by /api/scan (parent dir for a single file)
-let scanRecursive = false; // whether the current scan included subfolders — reused by batch compile
+let scanRecursive = false; // whether the current scan included subfolders - reused by batch compile
 
 async function doScan(path) {
   path = (path || '').trim();
@@ -841,13 +852,44 @@ optionCompileBtn.addEventListener('click', () => {
   showScreen(compileSettingsScreen);
 });
 
+/* "Play the videos directly": no snapshots, no overview images. Reviews
+   with a plain <video> element instead. Reachable from the mode screen and
+   from the sort-by-overview screen (as the "skip making overviews" choice). */
+async function startVideoReview(messageEl) {
+  messageEl.textContent = '';
+  try {
+    if (deselectedVideoIds.size) {
+      await fetch('/api/exclude', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: Array.from(deselectedVideoIds) }),
+      });
+    }
+    await fetch('/api/review_mode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'video' }),
+    });
+  } catch (e) {
+    messageEl.textContent = 'Could not reach the local server.';
+    return;
+  }
+
+  reviewMode = 'video';
+  showScreen(reviewScreen);
+  refreshStatus();
+}
+
+if (optionVideoBtn) optionVideoBtn.addEventListener('click', () => startVideoReview(modeMessage));
+if (overviewVideoBtn) overviewVideoBtn.addEventListener('click', () => startVideoReview(overviewMessage));
+
 if (optionOverviewBtn) {
   optionOverviewBtn.addEventListener('click', () => {
     overviewMessage.textContent = '';
     overviewDirInput.value = '';
     // scannedVideos already carries overview_path from /api/scan (which
     // checks right next to each video by default), so the first render
-    // here needs no extra round trip — Rescan only matters once the person
+    // here needs no extra round trip - Rescan only matters once the person
     // points at a separate overview folder.
     overviewScanResults = scannedVideos;
     renderOverviewScreen();
@@ -887,7 +929,7 @@ let preparingForReview = false; // true while the setup-screen "Prepare" panel i
 const startBtnIdleLabel = startBtn.textContent;
 
 function setFolderControlsDisabled(disabled) {
-  // Only one prepare job can run on the backend at a time — keep the other
+  // Only one prepare job can run on the backend at a time - keep the other
   // two panels' buttons disabled too so a click there can't silently fail
   // (or, worse, target a different folder while this one is still running).
   preparePanels.forEach(p => {
@@ -914,7 +956,7 @@ function wirePreparePanel(panel) {
 
     if (panel.autoReview) {
       // The folder/file was already scanned back on the intro screen (that's
-      // how we got to this settings screen at all) — no need to scan again,
+      // how we got to this settings screen at all) - no need to scan again,
       // which would also wipe out any files deselected on the mode screen.
       preparingForReview = true;
       startBtn.disabled = true;
@@ -986,7 +1028,7 @@ function pollPrepareStatus() {
         onPrepareFinished(data);
       }
     } catch (e) {
-      // transient fetch error — keep polling rather than giving up
+      // transient fetch error - keep polling rather than giving up
     }
   }, 700);
 }
@@ -1019,10 +1061,10 @@ function onPrepareFinished(data) {
       return;
     }
     if (data.cancelled) {
-      panel.message.textContent = `Cancelled — ${data.done_videos} video${data.done_videos === 1 ? '' : 's'} were already cached before stopping.`;
+      panel.message.textContent = `Cancelled - ${data.done_videos} video${data.done_videos === 1 ? '' : 's'} were already cached before stopping.`;
       return;
     }
-    let msg = `Done — ${data.done_videos} video${data.done_videos === 1 ? '' : 's'} ready for instant review.`;
+    let msg = `Done - ${data.done_videos} video${data.done_videos === 1 ? '' : 's'} ready for instant review.`;
     if (data.unreadable && data.unreadable.length) {
       msg += ` ${data.unreadable.length} file${data.unreadable.length === 1 ? '' : 's'} couldn't be read and will be auto-skipped during review.`;
     }
@@ -1034,12 +1076,12 @@ function onPrepareFinished(data) {
     preparingForReview = false;
     setFolderControlsDisabled(false);
     if (!data.error && !data.cancelled) {
-      // Every snapshot is ready — go straight into reviewing this folder.
+      // Every snapshot is ready - go straight into reviewing this folder.
       startBtn.disabled = false;
       startBtn.textContent = startBtnIdleLabel;
       enterReviewScreen();
     } else {
-      // Cancelled or failed — stay on the setup screen; the scan results
+      // Cancelled or failed - stay on the setup screen; the scan results
       // (and a manual Start button) are still right there if the person
       // wants to review anyway, with whatever got cached before stopping.
       startBtn.disabled = false;
@@ -1176,7 +1218,7 @@ function pollCompileBatchStatus() {
         onCompileBatchFinished(data);
       }
     } catch (e) {
-      // transient fetch error — keep polling rather than giving up
+      // transient fetch error - keep polling rather than giving up
     }
   }, 700);
 }
@@ -1221,10 +1263,10 @@ function onCompileBatchFinished(data) {
     return;
   }
   if (data.cancelled) {
-    compileBatchMessage.textContent = `Cancelled — ${data.done_videos} video${data.done_videos === 1 ? '' : 's'} were already compiled before stopping.`;
+    compileBatchMessage.textContent = `Cancelled - ${data.done_videos} video${data.done_videos === 1 ? '' : 's'} were already compiled before stopping.`;
     return;
   }
-  let msg = `Done — ${data.done_videos} video${data.done_videos === 1 ? '' : 's'} processed.`;
+  let msg = `Done - ${data.done_videos} video${data.done_videos === 1 ? '' : 's'} processed.`;
   if (data.failed && data.failed.length) {
     msg += ` ${data.failed.length} file${data.failed.length === 1 ? '' : 's'} could not be compiled.`;
   }
@@ -1247,7 +1289,7 @@ function renderOverviewScreen() {
 
   overviewReviewDesc.textContent = withOverview.length
     ? `Sort the ${withOverview.length} video${withOverview.length === 1 ? '' : 's'} that already ${withOverview.length === 1 ? 'has' : 'have'} an overview.`
-    : 'None yet — generate some first.';
+    : 'None yet - generate some first.';
   overviewGenerateDesc.textContent = withoutOverview.length
     ? `Create overviews for the ${withoutOverview.length} video${withoutOverview.length === 1 ? '' : 's'} missing one.`
     : 'Every selected video already has one.';
@@ -1345,7 +1387,7 @@ if (overviewGenerateBtn) {
     if (overviewGenerateBtn.disabled) return;
     const readyIds = overviewScanResults.filter(v => v.overview_path).map(v => v.id);
     const excludedIds = Array.from(new Set([...deselectedVideoIds, ...readyIds]));
-    // Note: no triggerBtn/idleLabel passed here — overviewGenerateBtn is a
+    // Note: no triggerBtn/idleLabel passed here - overviewGenerateBtn is a
     // card-style button with nested icon/title/desc spans, so swapping its
     // textContent for a "Starting…" label (as the plain compile-settings
     // button does) would wipe out that structure. Just disable it instead;
@@ -1371,7 +1413,7 @@ async function enterReviewScreen() {
         body: JSON.stringify({ ids: Array.from(deselectedVideoIds) }),
       });
     } catch (e) {
-      // non-critical — worst case the deselected files still show up in the queue
+      // non-critical - worst case the deselected files still show up in the queue
     }
   }
   showScreen(reviewScreen);
@@ -1388,11 +1430,12 @@ restartBtn.addEventListener('click', () => location.reload());
 stopBtn.addEventListener('click', async () => {
   stopSlideshow();
   stopBrokenPoll();
+  releaseVideo();
   stopBtn.disabled = true;
   try {
     await fetch('/api/stop', { method: 'POST' });
   } catch (e) {
-    // fall through — reload anyway so the user isn't stuck
+    // fall through - reload anyway so the user isn't stuck
   }
   location.reload();
 });
@@ -1426,6 +1469,8 @@ async function refreshStatus() {
   }
   reviewMode = data.review_mode || 'thumbnails';
   reviewScreen.classList.toggle('overview-mode', reviewMode === 'overview');
+  reviewScreen.classList.toggle('video-mode', reviewMode === 'video');
+  if (currentSettings) renderLegend(currentSettings); // legend lists the seek keys in video mode
 
   renderQueue(data);
   renderUnreadable(data);
@@ -1494,6 +1539,7 @@ function renderUnreadable(data) {
 
 function loadPreview(video) {
   if (reviewMode === 'overview') { loadOverviewPreview(video); return; }
+  if (reviewMode === 'video') { loadVideoPreview(video); return; }
 
   stopSlideshow();
   stopBrokenPoll();
@@ -1518,7 +1564,7 @@ function loadPreview(video) {
   urls.forEach((url, i) => {
     const img = new Image();
     img.onload = img.onerror = () => {
-      if (myToken !== loadToken) return; // user already moved on (e.g. hit Skip) — ignore
+      if (myToken !== loadToken) return; // user already moved on (e.g. hit Skip) - ignore
       loaded++;
       if (loaded === NUM_SNAPSHOTS) startSlideshow(images);
     };
@@ -1531,7 +1577,7 @@ function loadPreview(video) {
 
 /* "Sort by screenshot overview" mode: skip video decoding entirely and just
    show the existing screenshot-overview grid image for this video. No
-   slideshow timer, no scrubber, no per-frame requests — just one image. */
+   slideshow timer, no scrubber, no per-frame requests - just one image. */
 function loadOverviewPreview(video) {
   stopSlideshow();
   stopBrokenPoll();
@@ -1546,15 +1592,85 @@ function loadOverviewPreview(video) {
   const myToken = ++loadToken;
   const img = new Image();
   img.onload = () => {
-    if (myToken !== loadToken) return; // user already moved on — ignore
+    if (myToken !== loadToken) return; // user already moved on - ignore
     previewLoading.classList.add('hidden');
     previewImg.src = img.src;
   };
   img.onerror = () => {
     if (myToken !== loadToken) return;
-    previewLoading.textContent = 'No screenshot overview found for this video — Skip it, or press Compile to generate one now.';
+    previewLoading.textContent = 'No screenshot overview found for this video - Skip it, or press Compile to generate one now.';
   };
   img.src = `/api/overview_image/${video.id}?t=${Date.now()}`;
+}
+
+/* "Play the videos directly" mode: no snapshots and no overview images,
+   just the video itself in a <video> element. The same element is reused
+   for every video so volume and mute persist between videos. */
+function loadVideoPreview(video, startAt = 0) {
+  stopSlideshow();
+  stopBrokenPoll();
+  currentImages = null;
+  frameScrubber.disabled = true;
+  previewLoading.classList.remove('hidden');
+  previewLoading.textContent = 'Loading video…';
+
+  currentFilename.textContent = video.filename;
+  currentFilemeta.textContent = fmtSize(video.size);
+
+  // Drop focus from whatever was last clicked (a button, a slider) so the
+  // arrow keys and Space always go to the video, not to that control.
+  if (document.activeElement && document.activeElement !== document.body) {
+    document.activeElement.blur();
+  }
+
+  const myToken = ++loadToken;
+  previewVideo.onloadeddata = () => {
+    if (myToken !== loadToken) return;
+    previewLoading.classList.add('hidden');
+  };
+  previewVideo.onerror = () => {
+    if (myToken !== loadToken) return;
+    previewLoading.classList.remove('hidden');
+    previewLoading.textContent = "This browser can't play this video format. Skip it (Esc), or sort it anyway with a key.";
+  };
+
+  previewVideo.src = `/api/video/${video.id}?t=${Date.now()}`;
+  if (startAt > 0) {
+    previewVideo.addEventListener('loadedmetadata', () => {
+      if (myToken === loadToken) previewVideo.currentTime = startAt;
+    }, { once: true });
+  }
+  const p = previewVideo.play();
+  if (p && p.catch) p.catch(() => { /* autoplay blocked: the controls still work */ });
+}
+
+/* Stop playback and let go of the file. Required before a Delete / Sort
+   moves it, since some systems refuse to move a file that is still open. */
+function releaseVideo() {
+  if (!previewVideo) return;
+  previewVideo.onloadeddata = null;
+  previewVideo.onerror = null;
+  previewVideo.pause();
+  previewVideo.removeAttribute('src');
+  previewVideo.load();
+}
+
+function seekVideo(deltaSeconds) {
+  if (!previewVideo.getAttribute('src')) return;
+  let t = previewVideo.currentTime + deltaSeconds;
+  const dur = previewVideo.duration;
+  if (Number.isFinite(dur)) t = Math.min(t, Math.max(0, dur - 0.1));
+  previewVideo.currentTime = Math.max(0, t);
+}
+
+function toggleVideoPlayback() {
+  if (!previewVideo.getAttribute('src')) return;
+  if (previewVideo.paused) {
+    const p = previewVideo.play();
+    if (p && p.catch) p.catch(() => {});
+  } else {
+    previewVideo.pause();
+  }
 }
 
 /* While a preview is loading, periodically check whether the backend has
@@ -1573,7 +1689,7 @@ function startBrokenPoll(video, myToken) {
         await performAction('auto_skip');
       }
     } catch (e) {
-      // non-critical — worst case the person can still hit Skip manually
+      // non-critical - worst case the person can still hit Skip manually
     }
   }, 1500);
 }
@@ -1583,7 +1699,7 @@ function stopBrokenPoll() {
 }
 
 function startSlideshow(images, startIdx = 0) {
-  stopBrokenPoll(); // it loaded fine — no need to keep checking for 'broken'
+  stopBrokenPoll(); // it loaded fine - no need to keep checking for 'broken'
   previewLoading.classList.add('hidden');
   currentImages = images;
   slideshowIdx = startIdx;
@@ -1632,6 +1748,7 @@ frameScrubber.addEventListener('change', () => {
 function showDone(data) {
   stopSlideshow();
   stopBrokenPoll();
+  releaseVideo();
   showScreen(doneScreen);
   const counts = {};
   data.videos.forEach(v => {
@@ -1639,7 +1756,7 @@ function showDone(data) {
     counts[key] = (counts[key] || 0) + 1;
   });
   const parts = Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(' · ');
-  doneSummary.textContent = `${data.total} video${data.total === 1 ? '' : 's'} processed — ${parts}`;
+  doneSummary.textContent = `${data.total} video${data.total === 1 ? '' : 's'} processed - ${parts}`;
 }
 
 async function performAction(act) {
@@ -1647,6 +1764,17 @@ async function performAction(act) {
   busy = true;
   const body = { id: currentVideo.id, action: act };
   if (act === 'compile') body.num_shots = getCompilationShots();
+
+  // Delete and sort-moves relocate the file, so in video mode the player
+  // has to let go of it first. Keep/Skip/Compile don't touch it.
+  const movesFile = !['keep', 'skip', 'compile', 'auto_skip'].includes(act);
+  const releasedVideo = reviewMode === 'video' && movesFile;
+  const resumeAt = releasedVideo ? previewVideo.currentTime : 0;
+  if (releasedVideo) {
+    releaseVideo();
+    await new Promise(r => setTimeout(r, 150));
+  }
+
   try {
     const res = await fetch('/api/action', {
       method: 'POST',
@@ -1661,8 +1789,10 @@ async function performAction(act) {
       loadToken++; // invalidate any in-flight thumbnail loads for the video we just left
       currentVideo = null; // force next video to load
       await refreshStatus();
-    } else if (act === 'compile' && data.error) {
-      alert(data.error);
+    } else {
+      if (act === 'compile' && data.error) alert(data.error);
+      // The action failed, so we're staying on this video: bring the player back.
+      if (releasedVideo && currentVideo) loadVideoPreview(currentVideo, resumeAt);
     }
   } finally {
     busy = false;
@@ -1688,7 +1818,7 @@ async function performUndo() {
       currentVideo = null; // force the (now-pending-again) video to reload
       await refreshStatus();
     }
-    // On failure (nothing to undo) there's nothing to show — the button
+    // On failure (nothing to undo) there's nothing to show - the button
     // is disabled in that state anyway, this just guards manual retries.
   } finally {
     undoing = false;
@@ -1717,10 +1847,27 @@ document.addEventListener('keydown', (e) => {
   if (!onReview) return;
 
   // Skip always works, regardless of settings and even while a preview is
-  // still (or forever) loading — it's the escape hatch for a stuck video.
+  // still (or forever) loading - it's the escape hatch for a stuck video.
   if (e.key === 'Escape') {
     performAction('skip');
     return;
+  }
+
+  // Video mode: arrow keys rewind / fast-forward, Space plays / pauses.
+  // preventDefault also stops the native <video> controls from handling
+  // the same key a second time when the player has focus.
+  if (reviewMode === 'video' && !isFormField) {
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+      e.preventDefault();
+      const step = e.shiftKey ? VIDEO_SEEK_SECONDS_LONG : VIDEO_SEEK_SECONDS;
+      seekVideo(e.key === 'ArrowLeft' ? -step : step);
+      return;
+    }
+    if (e.key === ' ') {
+      e.preventDefault();
+      toggleVideoPlayback();
+      return;
+    }
   }
 
   if (!currentSettings) return;

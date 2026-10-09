@@ -182,10 +182,10 @@ input[type="range"] {
 
 .mode-prompt { margin: 22px 0 12px; font-size: 13.5px; color: var(--text-dim); text-align: center; }
 
-.option-cards { display: flex; gap: 14px; margin-bottom: 22px; }
+.option-cards { display: flex; flex-wrap: wrap; gap: 14px; margin-bottom: 22px; }
 
 .option-card {
-  flex: 1;
+  flex: 1 1 220px;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -504,6 +504,19 @@ kbd {
 .overview-mode .scrubber-row,
 .overview-mode #playback-panel { display: none; }
 .overview-mode #preview-img { object-fit: contain; }
+
+/* ---------- Review screen: "video" mode (plain video playback, no
+   snapshots or overview images) swaps the image for a <video> element ---------- */
+#preview-video {
+  display: none;
+  width: 100%; height: 100%; object-fit: contain; background: #000;
+}
+.video-mode #preview-video { display: block; }
+.video-mode #preview-img,
+.video-mode .frame-indicator,
+.video-mode .scrubber-row,
+.video-mode #playback-panel { display: none; }
+.video-mode .preview-loading { pointer-events: none; }
 
 .action-row { display: flex; gap: 10px; width: 100%; max-width: 900px; }
 .action-row .btn { flex: 1; }

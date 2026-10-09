@@ -41,9 +41,9 @@ import cv2
 import numpy as np
 from send2trash import send2trash
 
-# Belt-and-suspenders log silencing — different cv2 builds expose this
+# Belt-and-suspenders log silencing - different cv2 builds expose this
 # differently, so try every form rather than relying on just one.
-# Belt-and-suspenders log silencing — different cv2 builds expose this
+# Belt-and-suspenders log silencing - different cv2 builds expose this
 # differently, so try every form rather than relying on just one.
 try:
     cv2.setLogLevel(cv2.LOG_LEVEL_SILENT)
@@ -74,7 +74,7 @@ MAX_SLIDESHOW_MS = 3000
 # evenly-spaced frames straight from it (the same way preview thumbnails
 # are grabbed) and lay them out in a grid into a single image, saved right
 # next to the source video. The individual frames only ever exist as
-# in-memory arrays on the way to being pasted into the grid — nothing
+# in-memory arrays on the way to being pasted into the grid - nothing
 # per-frame is ever written to disk, so there's nothing to clean up
 # afterwards.
 # --------------------------------------------------------------------------
@@ -179,7 +179,7 @@ def _rmdir_if_empty(path):
 
 def remove_folder_dirs(folder):
     """Tear down both hidden subdirectories for a folder we're done with
-    (or leaving) — used when a folder finishes review, and when the person
+    (or leaving) - used when a folder finishes review, and when the person
     stops/switches folders."""
     if not folder:
         return
@@ -262,7 +262,7 @@ def run_with_timeout(fn, timeout=FRAME_TIMEOUT_SECONDS):
 # cv2.VideoCapture() on the *same file* at the same time. OpenCV's ffmpeg
 # backend is not safe for that: concurrent decodes of one file corrupt each
 # other's frame state, which is exactly what "sps_id out of range" /
-# "missing picture in access unit" / "error while decoding MB" are — and it
+# "missing picture in access unit" / "error while decoding MB" are - and it
 # gets worse (hangs, garbage frames) the more requests pile up at once.
 # A lock per file path keeps decoding of any single video serialized, while
 # still letting unrelated requests (status, actions, other videos) run
@@ -383,9 +383,23 @@ state = {
     "num_snapshots": DEFAULT_NUM_SNAPSHOTS,
     "settings": load_settings(),
     "last_action": None,  # the most recent action, kept around so it can be undone (see /api/undo)
-    "review_mode": "thumbnails",  # "thumbnails" (live slideshow) or "overview" (static screenshot-overview image)
+    "review_mode": "thumbnails",  # "thumbnails" (live slideshow), "overview" (static screenshot-overview image) or "video" (plain video playback)
 }
 state["num_snapshots"] = state["settings"]["default_num_snapshots"]
+
+
+def _move_with_retry(src, dst, attempts=10, delay=0.2):
+    """shutil.move() that tolerates the browser still holding the video file
+    open for a moment after playback was released (Windows refuses to move
+    a file that has an open handle). Retries briefly on PermissionError."""
+    for attempt in range(attempts):
+        try:
+            shutil.move(src, dst)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay)
 
 
 def _unique_dest(dest_path):
@@ -401,8 +415,8 @@ def finalize_pending_delete():
     """If the previous action was a Delete, the file has been sitting in
     the folder's hidden trash-holding directory (not the real OS Recycle
     Bin / Trash yet) purely so it could still be undone. Once it's no
-    longer the most recent action — because another action happened, or
-    the session is ending — actually send it to the OS trash for real.
+    longer the most recent action - because another action happened, or
+    the session is ending - actually send it to the OS trash for real.
     Must be called with state_lock held; safe to call unconditionally."""
     record = state.get("last_action")
     state["last_action"] = None
@@ -610,7 +624,7 @@ def set_compilation_shots():
 
 @app.route("/api/exclude", methods=["POST"])
 def exclude_videos():
-    """Drop specific videos (by id) out of the current queue entirely —
+    """Drop specific videos (by id) out of the current queue entirely -
     used by the "deselect some files" checkboxes on the scan-results list,
     so a video the person unchecks is never reviewed, sorted, or included
     in a batch compilation run."""
@@ -661,11 +675,12 @@ def scan_overviews():
 @app.route("/api/review_mode", methods=["POST"])
 def set_review_mode():
     """Switch how the review screen previews each video: "thumbnails" (the
-    default live slideshow) or "overview" (show the existing screenshot-
-    overview image instead, skipping video decoding entirely)."""
+    default live slideshow), "overview" (show the existing screenshot-
+    overview image instead, skipping video decoding entirely) or "video"
+    (play the video itself in the browser, no snapshots or overviews)."""
     data = request.get_json(force=True)
     mode = data.get("mode")
-    if mode not in ("thumbnails", "overview"):
+    if mode not in ("thumbnails", "overview", "video"):
         return jsonify({"success": False, "error": "Invalid review mode"})
 
     with state_lock:
@@ -688,13 +703,28 @@ def overview_image(vid):
     return send_file(video["overview_path"], mimetype="image/jpeg", max_age=0)
 
 
+@app.route("/api/video/<vid>")
+def video_stream(vid):
+    """Stream the video file itself for the "video" review mode. Range
+    requests are supported (conditional=True) so the browser can seek with
+    the arrow keys without downloading the whole file first."""
+    with state_lock:
+        video = find_video(vid)
+        path = video["path"] if video else None
+
+    if not path or not os.path.isfile(path):
+        return "", 404
+
+    return send_file(path, conditional=True, max_age=0)
+
+
 def list_videos_in_folder(folder, recursive=False):
     """Scan a folder for supported video files and build the same video-dict
     shape used everywhere else (id/filename/path/size/status/...). Shared by
     /api/scan, /api/prepare, and the --prepare CLI path so there's exactly
     one definition of what counts as a video and how its id is derived.
 
-    With `recursive=True`, subdirectories are walked too — except this
+    With `recursive=True`, subdirectories are walked too - except this
     tool's own hidden cache/trash directories, which must always be
     skipped or a held (undoable) delete sitting in the trash dir would be
     picked back up as a fresh pending video on the next scan."""
@@ -768,12 +798,12 @@ def single_video_entry(path):
 
 
 def resolve_video_selection(raw_path, recursive=False):
-    """Given whatever path the person typed, pasted, or picked — a folder
-    of videos, or a single video file — return (base_folder, videos).
+    """Given whatever path the person typed, pasted, or picked - a folder
+    of videos, or a single video file - return (base_folder, videos).
     `base_folder` is used for the cache/trash directories and as the
     default location for anything that isn't a single-file compilation
     override, so a single file resolves to its parent directory here.
-    `recursive` only applies to a folder selection — a single file is
+    `recursive` only applies to a folder selection - a single file is
     always just that one file regardless of the flag.
     Raises ValueError with a person-facing message on anything invalid."""
     p = Path(raw_path)
@@ -894,7 +924,7 @@ def _try_seek_and_read(path, seek_fn):
 def _try_sequential_read(path, target_frame, max_frames_scanned=4000):
     """Very last resort before giving up: read frames one at a time from the
     very start instead of seeking anywhere. Slower, but it never asks the
-    demuxer to jump — which is what trips up files with a badly broken
+    demuxer to jump - which is what trips up files with a badly broken
     keyframe index even after raising the read-attempts limit. Capped so a
     huge file can't stall a request for too long."""
     if target_frame <= 0:
@@ -947,7 +977,7 @@ def grab_frame(path, ratio):
         if frame is not None:
             return frame
 
-    # Every seek-based attempt failed — fall back to reading sequentially
+    # Every seek-based attempt failed - fall back to reading sequentially
     # from the start, which sidesteps seeking entirely.
     target_frame = int(frame_count * ratio) if frame_count > 0 else 0
     return _try_sequential_read(path, target_frame)
@@ -1033,7 +1063,7 @@ def build_compilation_image(path, num_shots):
     grid image, with a small timestamp burned into the top-right corner of
     each tile showing how far into the video that frame sits. Frames are
     pulled straight from the video with grab_frame() (the same routine used
-    for on-screen preview thumbnails) and combined entirely in memory — no
+    for on-screen preview thumbnails) and combined entirely in memory - no
     per-frame image file is ever written to disk, so there is nothing left
     over to clean up once the grid is built."""
     rows, cols = compilation_grid_dims(num_shots)
@@ -1108,7 +1138,7 @@ COUNT_TIMEOUT_SECONDS = 30
 
 def _count_frames_sequential(path, safety_cap=500000):
     """Fast real frame count via grab() only (skips the decode/color-convert
-    that read() does) — used when the container's own metadata
+    that read() does) - used when the container's own metadata
     (CAP_PROP_FRAME_COUNT) is missing or zero, which is common on exactly
     the broken-seek-index files this whole fallback exists for."""
     cap = cv2.VideoCapture(path)
@@ -1129,12 +1159,12 @@ def _count_frames_sequential(path, safety_cap=500000):
 
 def _sequential_batch_fill(video, num_snapshots, want_idx):
     """Last-resort fallback for files where every *seek* fails or times out
-    (broken keyframe index, odd VFR footage, etc.) — the "packet read max
+    (broken keyframe index, odd VFR footage, etc.) - the "packet read max
     attempts exceeded" case. cv2's seek-based reads keep failing on these
     because seeking is what's broken, not decoding: the file plays back just
     fine start-to-finish (which is why it works in VLC). So instead of
     seeking, this opens the file once and reads forward from frame 0,
-    grabbing every snapshot frame as playback passes its target position —
+    grabbing every snapshot frame as playback passes its target position -
     exactly what a normal player does. One linear pass fills in every
     snapshot for the video at once, so this expensive path only ever runs
     once per problem video, not once per thumbnail.
@@ -1145,7 +1175,7 @@ def _sequential_batch_fill(video, num_snapshots, want_idx):
 
     if frame_count <= 0:
         # Container metadata didn't give us a usable total (common on
-        # exactly these broken files) — count for real instead of giving up.
+        # exactly these broken files) - count for real instead of giving up.
         frame_count = run_with_timeout(
             lambda: _count_frames_sequential(path), timeout=COUNT_TIMEOUT_SECONDS
         ) or 0
@@ -1207,14 +1237,14 @@ def ensure_thumbnail_cached(video, idx, num_snapshots):
     """Make sure a cache file exists on disk for this (video, idx,
     num_snapshots) combination, generating and writing it if it doesn't.
 
-    This is the one shared code path for "produce a thumbnail" — used both
+    This is the one shared code path for "produce a thumbnail" - used both
     by the live /api/thumbnail route (one frame at a time, as the browser
     asks for it) and by prepare mode, which calls this for every index of
     every video in a folder ahead of time so review never has to decode
     anything itself.
 
     Returns the cache Path on success. Returns None if this file couldn't
-    be read by any strategy we have (or a single attempt timed out) — the
+    be read by any strategy we have (or a single attempt timed out) - the
     caller decides what to do about it (the live route falls back to a
     placeholder; prepare just logs it and moves on to the next video). On a
     definitive failure this also marks the video "broken" in shared state,
@@ -1236,7 +1266,7 @@ def ensure_thumbnail_cached(video, idx, num_snapshots):
     ratio = (idx + 1) / num_snapshots  # e.g. 5%, 10%, ... 100% for 20 snapshots
 
     # Only one thread may decode this particular file at a time (see
-    # _get_video_lock) — this is what actually fixes the corruption/hang
+    # _get_video_lock) - this is what actually fixes the corruption/hang
     # from concurrent decodes, and also means only one thread will ever
     # trigger the sequential fallback below for a given video.
     with _get_video_lock(video["path"]):
@@ -1248,7 +1278,7 @@ def ensure_thumbnail_cached(video, idx, num_snapshots):
         frame = run_with_timeout(lambda: grab_frame(video["path"], ratio))
 
         if frame is None:
-            # Seeking is unreliable for this file — fall back to one
+            # Seeking is unreliable for this file - fall back to one
             # sequential decode pass that fills in every snapshot at once.
             if _sequential_batch_fill(video, num_snapshots, idx) and cache_file.exists():
                 return cache_file
@@ -1257,7 +1287,7 @@ def ensure_thumbnail_cached(video, idx, num_snapshots):
             # Both the fast seek-based path AND the full sequential decode
             # (which counts real frames itself when metadata is bad) failed
             # to produce anything at all for this file. That's not a
-            # transient hiccup — this file genuinely can't be read by any
+            # transient hiccup - this file genuinely can't be read by any
             # strategy we have, so mark it and stop retrying it.
             with state_lock:
                 v = find_video(video["id"])
@@ -1285,7 +1315,7 @@ def thumbnail(vid, idx):
     if not os.path.isfile(video["path"]):
         return "", 404
 
-    # Already established this file can't be read by any strategy we have —
+    # Already established this file can't be read by any strategy we have -
     # don't burn time (or spam warnings) retrying it on every single
     # thumbnail index. Just hand back the placeholder immediately.
     if video.get("broken"):
@@ -1296,7 +1326,7 @@ def thumbnail(vid, idx):
     if cache_file is not None:
         return send_file(cache_file, mimetype="image/jpeg", max_age=3600)
 
-    # Couldn't produce this frame just now — either it was just marked
+    # Couldn't produce this frame just now - either it was just marked
     # broken above, or a single attempt timed out transiently. Either way,
     # hand back a placeholder without caching it, so a transient failure
     # still gets a fresh chance on the next request.
@@ -1331,17 +1361,17 @@ def action():
                 # Held in a hidden per-folder trash dir (not the OS trash
                 # yet) so this can still be undone with Backspace. It's
                 # finalized for real the next time finalize_pending_delete()
-                # runs — i.e. on the next action, or when the session ends.
+                # runs - i.e. on the next action, or when the session ends.
                 trash_dir = get_trash_dir(state["folder"])
                 held_path = _unique_dest(trash_dir / video["filename"])
-                shutil.move(orig_path, str(held_path))
+                _move_with_retry(orig_path, str(held_path))
                 video["path"] = str(held_path)
                 video["status"] = "deleted"
                 record["orig_path"] = orig_path
                 record["held_path"] = str(held_path)
 
                 # Keep a companion screenshot-overview image (if any) from
-                # being left behind as clutter — hold it alongside the video
+                # being left behind as clutter - hold it alongside the video
                 # so this stays undoable too, and it gets sent to the real
                 # trash together with the video by finalize_pending_delete().
                 overview_path = video.get("overview_path")
@@ -1353,7 +1383,7 @@ def action():
                         record["held_overview_path"] = str(held_overview_path)
                         video["overview_path"] = str(held_overview_path)
                     except Exception:
-                        pass  # non-fatal — the video delete itself already succeeded
+                        pass  # non-fatal - the video delete itself already succeeded
 
             elif act == "keep":
                 video["status"] = "kept"
@@ -1375,14 +1405,14 @@ def action():
                 record["num_shots"] = num_shots
 
             elif act == "skip":
-                # Just move past it — no file operation at all. Used as the
+                # Just move past it - no file operation at all. Used as the
                 # escape hatch for a video that's hanging or won't preview.
                 video["status"] = "skipped"
 
             elif act == "auto_skip":
                 # Same as skip (no file operation) but only ever sent by the
                 # frontend after the backend has already marked this file
-                # unreadable — kept as a distinct status so it shows up in
+                # unreadable - kept as a distinct status so it shows up in
                 # its own "couldn't be read" list instead of blending in
                 # with videos the person chose to skip themselves.
                 video["status"] = "auto_skipped"
@@ -1396,7 +1426,7 @@ def action():
                 subdir = os.path.join(state["folder"], folder)
                 os.makedirs(subdir, exist_ok=True)
                 dest = str(_unique_dest(Path(subdir) / video["filename"]))
-                shutil.move(orig_path, dest)
+                _move_with_retry(orig_path, dest)
                 video["path"] = dest
                 video["status"] = "moved"
                 video["destination"] = folder
@@ -1414,7 +1444,7 @@ def action():
                         record["dest_overview_path"] = dest_overview
                         video["overview_path"] = dest_overview
                     except Exception:
-                        pass  # non-fatal — the video move itself already succeeded
+                        pass  # non-fatal - the video move itself already succeeded
 
         except Exception as e:
             return jsonify({"success": False, "error": str(e)})
@@ -1424,7 +1454,7 @@ def action():
         cache_dir = video["cache_dir"]
         folder = state["folder"]
 
-    # Done with this video one way or another — its cached snapshot images
+    # Done with this video one way or another - its cached snapshot images
     # (whether generated live during review, or ahead of time by prepare
     # mode) are no longer needed, regardless of which snapshot count(s)
     # they were generated at. This also shrinks the cache directory away
@@ -1435,7 +1465,7 @@ def action():
         all_done = folder == state["folder"] and not any(v["status"] == "pending" for v in state["videos"])
 
     if all_done:
-        # The whole folder has been processed — remove the cache subdir
+        # The whole folder has been processed - remove the cache subdir
         # outright (it should already be empty from per-video cleanup, but
         # this catches any stragglers, e.g. from prepare-mode runs at a
         # different snapshot count).
@@ -1447,7 +1477,7 @@ def action():
 @app.route("/api/undo", methods=["POST"])
 def undo():
     """Reverse the single most recent action. Only one level of undo is
-    kept — performing (or undoing) an action clears it, so Backspace always
+    kept - performing (or undoing) an action clears it, so Backspace always
     means "undo whatever I just did", not a full history stack."""
     with state_lock:
         record = state.get("last_action")
@@ -1519,7 +1549,7 @@ def undo():
 # An alternative to the interactive review/sort flow: instead of stepping
 # through videos one at a time, generate a screenshot-compilation image for
 # every video in a folder in one background job (structured just like
-# Prepare mode below — a worker thread the setup screen polls for
+# Prepare mode below - a worker thread the setup screen polls for
 # progress). Videos the person has deselected in the scan results are
 # passed in as `excluded_ids` and skipped entirely.
 # --------------------------------------------------------------------------
@@ -1670,7 +1700,7 @@ def compile_batch_cancel():
 # Reviewing a folder over a slow network means every thumbnail has to be
 # decoded on the machine running the server (often the NAS/remote box) and
 # then streamed to the browser, one frame at a time, right as the person
-# scrubs to it — normally hidden behind the "loading previews" spinner for
+# scrubs to it - normally hidden behind the "loading previews" spinner for
 # each video. Prepare mode does that same decoding work ahead of time for
 # an entire folder, so a later review session finds every thumbnail already
 # sitting in the cache and never waits on a decode. It's just the existing
@@ -1708,7 +1738,7 @@ def _prepare_worker(num_snapshots, videos):
                         if _prepare_state["cancelled"]:
                             break
                     if ensure_thumbnail_cached(video, idx, num_snapshots) is None:
-                        # This video can't be read by any strategy we have —
+                        # This video can't be read by any strategy we have -
                         # no point burning time on its remaining indices too.
                         with _prepare_lock:
                             _prepare_state["unreadable"].append(video["filename"])
@@ -1805,8 +1835,8 @@ def run_prepare_cli(folder, num_snapshots):
                     unreadable.append(video["filename"])
                     break
                 ok_count += 1
-        status = "done" if ok_count == num_snapshots else f"stopped early ({ok_count}/{num_snapshots} — unreadable)"
-        print(f" — {status}")
+        status = "done" if ok_count == num_snapshots else f"stopped early ({ok_count}/{num_snapshots} - unreadable)"
+        print(f" - {status}")
 
     print(f"\nPrepared {len(videos) - len(unreadable)}/{len(videos)} video(s).")
     if unreadable:

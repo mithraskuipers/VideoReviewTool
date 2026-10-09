@@ -17,7 +17,7 @@
         <span class="brand-mark">▤</span>
         <div>
           <h1>VideoReviewTool</h1>
-          <p class="subtitle">Skim, sort and clean videos in seconds — or turn each one into a quick screenshot-grid preview.</p>
+          <p class="subtitle">Skim, sort and clean videos in seconds - or turn each one into a quick screenshot-grid preview.</p>
         </div>
       </div>
 
@@ -30,7 +30,7 @@
       <div id="dropzone" class="dropzone">
         <p class="dropzone-title">Drop a video file or folder here</p>
         <p class="dropzone-hint">Browsers can't read a real disk path from a drag-and-drop action,
-          so use one of the buttons below to choose reliably — or paste the path directly.</p>
+          so use one of the buttons below to choose reliably - or paste the path directly.</p>
         <div class="dropzone-buttons">
           <button id="browse-folder-btn" class="btn btn-primary">Browse for a folder…</button>
           <button id="browse-file-btn" class="btn btn-secondary">Browse for a single file…</button>
@@ -61,7 +61,7 @@
         <span class="brand-mark small">▤</span>
         <div>
           <h1 id="mode-heading">Videos found</h1>
-          <p class="subtitle" id="mode-location">—</p>
+          <p class="subtitle" id="mode-location">-</p>
         </div>
       </div>
 
@@ -88,6 +88,11 @@
           <span class="option-card-icon">🗂</span>
           <span class="option-card-title">Sort by screenshot overview</span>
           <span class="option-card-desc">Already have (or want) a screenshot-grid image per video? Judge and sort from that instead of a live slideshow.</span>
+        </button>
+        <button id="option-video-btn" class="option-card">
+          <span class="option-card-icon">🎬</span>
+          <span class="option-card-title">Play the videos directly</span>
+          <span class="option-card-desc">No snapshots, no overview images. Each video just plays; use the left and right arrow keys to rewind and fast-forward.</span>
         </button>
       </div>
 
@@ -142,8 +147,8 @@
         <button id="prepare-btn" class="btn btn-secondary btn-block">⚡ Prepare snapshots for this folder</button>
         <p class="dropzone-hint" style="margin:6px 0 0;">
           Optional. Pre-generates and caches every snapshot for every video in the folder above,
-          using the snapshot count set above. Makes reviewing near-instant afterwards — especially
-          worthwhile on a slow network — but takes a while up front for large folders. You can also
+          using the snapshot count set above. Makes reviewing near-instant afterwards - especially
+          worthwhile on a slow network - but takes a while up front for large folders. You can also
           run this from the command line: <code>python app.py --prepare "path\to\folder"</code>.
         </p>
       </div>
@@ -244,7 +249,7 @@
         <span class="brand-mark small">🖼</span>
         <div>
           <h1>Creating screenshot compilations</h1>
-          <p class="subtitle" id="compile-progress-subtitle">—</p>
+          <p class="subtitle" id="compile-progress-subtitle">-</p>
         </div>
       </div>
 
@@ -262,7 +267,7 @@
       <div class="step-actions">
         <button id="compile-batch-cancel-btn" class="btn btn-secondary" disabled>Cancel</button>
         <button id="compile-batch-back-to-overview-btn" class="btn btn-secondary hidden">← Back to sort-by-overview</button>
-        <button id="compile-batch-done-btn" class="btn btn-primary hidden">Done — start over</button>
+        <button id="compile-batch-done-btn" class="btn btn-primary hidden">Done - start over</button>
       </div>
     </div>
   </section>
@@ -283,7 +288,7 @@
         <button id="overview-dir-browse-btn" class="btn btn-secondary">Browse…</button>
       </div>
       <p class="dropzone-hint" style="margin:6px 0 0;">
-        Leave this blank to look for <code>&lt;filename&gt;_screenshot_overview.jpg</code> right next to each video —
+        Leave this blank to look for <code>&lt;filename&gt;_screenshot_overview.jpg</code> right next to each video -
         the default location used when creating compilations.
       </p>
       <button id="overview-rescan-btn" class="btn btn-secondary btn-block" style="margin-top:10px;">🔍 Check which videos have an overview ready</button>
@@ -303,6 +308,11 @@
           <span class="option-card-icon">🖼</span>
           <span class="option-card-title">Generate the missing overviews first</span>
           <span class="option-card-desc" id="overview-generate-desc">Create screenshot overviews for videos that don't have one yet.</span>
+        </button>
+        <button id="overview-video-btn" class="option-card">
+          <span class="option-card-icon">🎬</span>
+          <span class="option-card-title">Skip overviews, play the videos</span>
+          <span class="option-card-desc">Don't make any overview images. Just play each video (left and right arrow keys to rewind and fast-forward).</span>
         </button>
       </div>
 
@@ -336,6 +346,7 @@
       <main class="preview-pane">
         <div class="preview-frame">
           <img id="preview-img" alt="Video snapshot preview">
+          <video id="preview-video" controls loop playsinline preload="metadata"></video>
           <div id="preview-loading" class="preview-loading">Loading previews…</div>
           <div class="frame-indicator">
             <span id="frame-index">1</span> / <span id="frame-total">20</span>
@@ -348,8 +359,8 @@
         </div>
 
         <div class="current-file">
-          <div class="current-file-name" id="current-filename">—</div>
-          <div class="current-file-meta" id="current-filemeta">—</div>
+          <div class="current-file-name" id="current-filename">-</div>
+          <div class="current-file-meta" id="current-filemeta">-</div>
         </div>
 
         <div class="action-row">
