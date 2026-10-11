@@ -529,3 +529,39 @@ kbd {
   .main-layout { grid-template-columns: 1fr; height: auto; }
   .sidebar { border-left: none; border-top: 1px solid var(--border); }
 }
+
+/* ---------- In-page folder / file picker ---------- */
+.picker-overlay {
+  position: fixed; inset: 0; z-index: 1000;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex; align-items: center; justify-content: center;
+}
+.picker-dialog {
+  width: 600px; max-width: 94vw; max-height: 86vh;
+  display: flex; flex-direction: column; gap: 10px;
+  background: var(--bg-raised); border: 1px solid var(--border);
+  border-radius: 12px; padding: 18px 20px;
+}
+.picker-dialog h3 { margin: 0; font-size: 16px; }
+.picker-path-row { display: flex; gap: 8px; }
+#picker-path-input {
+  flex: 1; min-width: 0; padding: 7px 10px;
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  font-family: var(--mono); font-size: 12.5px;
+}
+#picker-path-input:focus { outline: none; border-color: var(--accent); }
+.picker-list {
+  list-style: none; margin: 0; padding: 4px;
+  flex: 1; min-height: 240px; overflow-y: auto;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+}
+.picker-item {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 7px 10px; background: none; border: none; border-radius: 6px;
+  color: var(--text); font-size: 13.5px; text-align: left; cursor: pointer;
+}
+.picker-item:hover, .picker-item:focus { background: var(--bg-panel); outline: none; }
+.picker-item-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.picker-empty { padding: 14px; color: var(--text-dim); font-size: 13px; }
+.picker-actions { display: flex; justify-content: flex-end; gap: 10px; }

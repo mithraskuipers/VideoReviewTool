@@ -493,6 +493,25 @@
     </div>
   </section>
 
+  <!-- In-page folder/file picker: lists the SERVER's files but is drawn by the
+       browser, so it opens on whichever device is using the app. -->
+  <div id="picker-modal" class="picker-overlay hidden">
+    <div class="picker-dialog" role="dialog" aria-modal="true" aria-labelledby="picker-title">
+      <h3 id="picker-title">Select a folder</h3>
+      <div class="picker-path-row">
+        <button id="picker-up-btn" class="btn btn-secondary btn-small" title="Up one level">↑ Up</button>
+        <input id="picker-path-input" type="text" spellcheck="false" autocomplete="off" />
+        <button id="picker-go-btn" class="btn btn-secondary btn-small">Go</button>
+      </div>
+      <ul id="picker-list" class="picker-list"></ul>
+      <p id="picker-message" class="message"></p>
+      <div class="picker-actions">
+        <button id="picker-cancel-btn" class="btn btn-secondary">Cancel</button>
+        <button id="picker-select-btn" class="btn btn-primary">Select this folder</button>
+      </div>
+    </div>
+  </div>
+
 </div>
 
 <script src="{{ url_for('static', filename='script.js') }}"></script>

@@ -280,54 +280,128 @@ function fmtSize(bytes) {
   return val.toFixed(1) + ' ' + units[i];
 }
 
+/* ---------------- Folder / file picker ----------------
+   Drawn in the page (not by the server's desktop), so it opens on the
+   device you are using while listing the files on the machine running the
+   app. pickPath() resolves with the chosen path, or null if cancelled. */
+
+const pickerModal = document.getElementById('picker-modal');
+const pickerTitle = document.getElementById('picker-title');
+const pickerPathInput = document.getElementById('picker-path-input');
+const pickerList = document.getElementById('picker-list');
+const pickerMessage = document.getElementById('picker-message');
+const pickerUpBtn = document.getElementById('picker-up-btn');
+const pickerGoBtn = document.getElementById('picker-go-btn');
+const pickerCancelBtn = document.getElementById('picker-cancel-btn');
+const pickerSelectBtn = document.getElementById('picker-select-btn');
+
+let pickerResolve = null;
+let pickerMode = 'folder';
+let pickerCurrent = '';
+let pickerParent = null;
+let pickerRequest = 0;
+
+function pickPath(mode, startPath) {
+  return new Promise((resolve) => {
+    if (pickerResolve) pickerResolve(null);
+    pickerResolve = resolve;
+    pickerMode = mode;
+    pickerTitle.textContent = mode === 'file' ? 'Select a video file'
+      : mode === 'output' ? 'Select an output folder' : 'Select a folder with videos';
+    pickerSelectBtn.classList.toggle('hidden', mode === 'file');
+    pickerMessage.textContent = '';
+    pickerModal.classList.remove('hidden');
+    loadPickerDir((startPath || '').trim());
+  });
+}
+
+function closePicker(result) {
+  pickerModal.classList.add('hidden');
+  const resolve = pickerResolve;
+  pickerResolve = null;
+  if (resolve) resolve(result);
+}
+
+async function loadPickerDir(path) {
+  const myRequest = ++pickerRequest;
+  pickerMessage.textContent = '';
+  try {
+    const res = await fetch('/api/listdir', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path, mode: pickerMode }),
+    });
+    const data = await res.json();
+    if (myRequest !== pickerRequest) return;
+    if (!data.success) { pickerMessage.textContent = data.error || 'Could not open that folder.'; return; }
+    renderPickerDir(data);
+  } catch (e) {
+    if (myRequest !== pickerRequest) return;
+    pickerMessage.textContent = 'Could not reach the server.';
+  }
+}
+
+function renderPickerDir(data) {
+  pickerCurrent = data.path;
+  pickerParent = data.parent;
+  pickerPathInput.value = data.is_drives ? '' : data.path;
+  pickerPathInput.placeholder = data.is_drives ? 'Drives' : '';
+  pickerUpBtn.disabled = pickerParent === null;
+  pickerSelectBtn.disabled = !!data.is_drives;
+
+  pickerList.textContent = '';
+  if (!data.entries.length) {
+    const li = document.createElement('li');
+    li.className = 'picker-empty';
+    li.textContent = pickerMode === 'file' ? 'No subfolders or video files here.' : 'No subfolders here.';
+    pickerList.appendChild(li);
+    return;
+  }
+  for (const entry of data.entries) {
+    const li = document.createElement('li');
+    const btn = document.createElement('button');
+    btn.className = 'picker-item';
+    const icon = document.createElement('span');
+    icon.textContent = entry.is_dir ? '📁' : '🎞️';
+    const name = document.createElement('span');
+    name.className = 'picker-item-name';
+    name.textContent = entry.name;
+    btn.append(icon, name);
+    btn.addEventListener('click', () => {
+      if (entry.is_dir) loadPickerDir(entry.path);
+      else closePicker(entry.path);
+    });
+    li.appendChild(btn);
+    pickerList.appendChild(li);
+  }
+}
+
+pickerUpBtn.addEventListener('click', () => { if (pickerParent !== null) loadPickerDir(pickerParent); });
+pickerGoBtn.addEventListener('click', () => loadPickerDir(pickerPathInput.value.trim()));
+pickerPathInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); loadPickerDir(pickerPathInput.value.trim()); }
+});
+pickerCancelBtn.addEventListener('click', () => closePicker(null));
+pickerSelectBtn.addEventListener('click', () => closePicker(pickerCurrent));
+pickerModal.addEventListener('mousedown', (e) => { if (e.target === pickerModal) closePicker(null); });
+// Capture phase so Esc closes the picker instead of reaching the app's own hotkeys.
+document.addEventListener('keydown', (e) => {
+  if (pickerModal.classList.contains('hidden')) return;
+  if (e.key === 'Escape') { e.preventDefault(); e.stopImmediatePropagation(); closePicker(null); }
+}, true);
+
 /* ---------------- Setup screen ---------------- */
 
 browseFolderBtn.addEventListener('click', async () => {
   introMessage.textContent = '';
-  browseFolderBtn.disabled = true;
-  const idle = browseFolderBtn.textContent;
-  browseFolderBtn.textContent = 'Waiting for folder dialog…';
-  try {
-    const res = await fetch('/api/browse', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode: 'folder' }),
-    });
-    const data = await res.json();
-    if (data.success) {
-      pathInput.value = data.path;
-    } else if (data.error && data.error !== 'Nothing selected') {
-      introMessage.textContent = data.error;
-    }
-  } catch (e) {
-    introMessage.textContent = 'Could not reach the local server.';
-  }
-  browseFolderBtn.disabled = false;
-  browseFolderBtn.textContent = idle;
+  const picked = await pickPath('folder', pathInput.value);
+  if (picked) pathInput.value = picked;
 });
 
 browseFileBtn.addEventListener('click', async () => {
   introMessage.textContent = '';
-  browseFileBtn.disabled = true;
-  const idle = browseFileBtn.textContent;
-  browseFileBtn.textContent = 'Waiting for file dialog…';
-  try {
-    const res = await fetch('/api/browse', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode: 'file' }),
-    });
-    const data = await res.json();
-    if (data.success) {
-      pathInput.value = data.path;
-    } else if (data.error && data.error !== 'Nothing selected') {
-      introMessage.textContent = data.error;
-    }
-  } catch (e) {
-    introMessage.textContent = 'Could not reach the local server.';
-  }
-  browseFileBtn.disabled = false;
-  browseFileBtn.textContent = idle;
+  const picked = await pickPath('file', pathInput.value);
+  if (picked) pathInput.value = picked;
 });
 
 pathInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') goToModeScreen(); });
@@ -1102,23 +1176,8 @@ function getExcludedIdsForBatch() {
 if (compileOutputBrowseBtn) {
   compileOutputBrowseBtn.addEventListener('click', async () => {
     compileSettingsMessage.textContent = '';
-    compileOutputBrowseBtn.disabled = true;
-    try {
-      const res = await fetch('/api/browse', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode: 'output' }),
-      });
-      const data = await res.json();
-      if (data.success) {
-        compileOutputInput.value = data.path;
-      } else if (data.error && data.error !== 'Nothing selected') {
-        compileSettingsMessage.textContent = data.error;
-      }
-    } catch (e) {
-      compileSettingsMessage.textContent = 'Could not reach the local server.';
-    }
-    compileOutputBrowseBtn.disabled = false;
+    const picked = await pickPath('output', compileOutputInput.value);
+    if (picked) compileOutputInput.value = picked;
   });
 }
 
@@ -1332,23 +1391,8 @@ if (overviewRescanBtn) overviewRescanBtn.addEventListener('click', rescanOvervie
 if (overviewDirBrowseBtn) {
   overviewDirBrowseBtn.addEventListener('click', async () => {
     overviewMessage.textContent = '';
-    overviewDirBrowseBtn.disabled = true;
-    try {
-      const res = await fetch('/api/browse', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode: 'output' }),
-      });
-      const data = await res.json();
-      if (data.success) {
-        overviewDirInput.value = data.path;
-      } else if (data.error && data.error !== 'Nothing selected') {
-        overviewMessage.textContent = data.error;
-      }
-    } catch (e) {
-      overviewMessage.textContent = 'Could not reach the local server.';
-    }
-    overviewDirBrowseBtn.disabled = false;
+    const picked = await pickPath('output', overviewDirInput.value);
+    if (picked) overviewDirInput.value = picked;
   });
 }
 

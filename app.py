@@ -17,8 +17,7 @@ import math
 import shutil
 import hashlib
 import socket
-import subprocess
-import sys
+import string
 import threading
 import webbrowser
 import concurrent.futures
@@ -469,83 +468,63 @@ def index():
 # API
 # --------------------------------------------------------------------------
 
-def _native_linux_dialog(mode):
-    """Open the desktop's own file chooser through zenity or kdialog, which
-    appears almost instantly (unlike Tk, which has to start a whole new
-    interpreter-embedded GUI toolkit on every click and uses a slow,
-    dated dialog). Returns (handled, path): `handled` is False when no
-    usable native dialog exists so the caller can fall back to Tk, and
-    `path` is "" when the person cancelled."""
-    home = str(Path.home())
-    exts = " ".join(f"*{ext}" for ext in sorted(VIDEO_EXTENSIONS))
-
-    if shutil.which("zenity"):
-        title = {"file": "Select a video file", "output": "Select an output folder"}.get(
-            mode, "Select folder with videos")
-        cmd = ["zenity", "--file-selection", f"--title={title}", f"--filename={home}/"]
-        if mode == "file":
-            cmd += [f"--file-filter=Video files | {exts}", "--file-filter=All files | *"]
-        else:
-            cmd.append("--directory")
-    elif shutil.which("kdialog"):
-        if mode == "file":
-            cmd = ["kdialog", "--getopenfilename", home, f"{exts}|Video files"]
-        else:
-            cmd = ["kdialog", "--getexistingdirectory", home]
-    else:
-        return False, ""
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
-    except OSError:
-        return False, ""
-
-    if result.returncode == 0:
-        return True, result.stdout.strip()
-    if result.returncode == 1:  # cancelled
-        return True, ""
-    return False, ""  # e.g. no display for this tool: let Tk have a go
+DRIVES_MARKER = "::drives::"
 
 
-@app.route("/api/browse", methods=["POST"])
-def browse():
-    """Open a native picker on the machine running the server. `mode`
-    selects which dialog to show: "folder" (default) or "output" both open
-    a directory picker; "file" opens a single-video file picker."""
+@app.route("/api/listdir", methods=["POST"])
+def listdir():
+    """List a folder on the machine running the server, for the in-page
+    folder/file picker. The picker is drawn by the browser, so it opens on
+    whichever device is viewing the app while showing the server's files.
+    `mode` is "folder"/"output" (folders only) or "file" (folders plus
+    video files). An empty or missing path starts in the home folder."""
     data = request.get_json(silent=True) or {}
     mode = data.get("mode", "folder")
+    raw = (data.get("path") or "").strip()
 
-    if sys.platform.startswith("linux"):
-        handled, path = _native_linux_dialog(mode)
-        if handled:
-            if not path:
-                return jsonify({"success": False, "error": "Nothing selected"})
-            return jsonify({"success": True, "path": path})
+    if os.name == "nt" and raw == DRIVES_MARKER:
+        drives = [f"{c}:\\" for c in string.ascii_uppercase if os.path.exists(f"{c}:\\")]
+        return jsonify({
+            "success": True, "path": DRIVES_MARKER, "parent": None, "is_drives": True,
+            "entries": [{"name": d, "path": d, "is_dir": True} for d in drives],
+        })
 
+    path = os.path.abspath(os.path.expanduser(raw)) if raw else str(Path.home())
+    if os.path.isfile(path):
+        path = os.path.dirname(path)
+    # Walk up to the nearest folder that exists (e.g. a half-typed path).
+    while not os.path.isdir(path):
+        up = os.path.dirname(path)
+        if up == path:
+            path = str(Path.home())
+            break
+        path = up
+
+    entries = []
     try:
-        import tkinter as tk
-        from tkinter import filedialog
+        with os.scandir(path) as it:
+            for entry in it:
+                if entry.name.startswith("."):
+                    continue
+                try:
+                    is_dir = entry.is_dir()
+                except OSError:
+                    continue
+                if is_dir:
+                    entries.append({"name": entry.name, "path": entry.path, "is_dir": True})
+                elif mode == "file" and os.path.splitext(entry.name)[1].lower() in VIDEO_EXTENSIONS:
+                    entries.append({"name": entry.name, "path": entry.path, "is_dir": False})
+    except OSError as e:
+        return jsonify({"success": False, "error": f"Cannot open this folder: {e.strerror or e}"})
 
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
+    entries.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
 
-        if mode == "file":
-            filetypes = [("Video files", " ".join(f"*{ext}" for ext in sorted(VIDEO_EXTENSIONS))),
-                         ("All files", "*.*")]
-            path = filedialog.askopenfilename(title="Select a video file", filetypes=filetypes)
-        elif mode == "output":
-            path = filedialog.askdirectory(title="Select an output folder")
-        else:
-            path = filedialog.askdirectory(title="Select folder with videos")
+    parent = os.path.dirname(path)
+    if parent == path:
+        parent = DRIVES_MARKER if os.name == "nt" else None
 
-        root.destroy()
-
-        if not path:
-            return jsonify({"success": False, "error": "Nothing selected"})
-        return jsonify({"success": True, "path": path})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+    return jsonify({"success": True, "path": path, "parent": parent,
+                    "is_drives": False, "entries": entries})
 
 
 @app.route("/api/settings", methods=["GET"])
