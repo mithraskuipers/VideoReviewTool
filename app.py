@@ -17,6 +17,8 @@ import math
 import shutil
 import hashlib
 import socket
+import subprocess
+import sys
 import threading
 import webbrowser
 import concurrent.futures
@@ -467,6 +469,44 @@ def index():
 # API
 # --------------------------------------------------------------------------
 
+def _native_linux_dialog(mode):
+    """Open the desktop's own file chooser through zenity or kdialog, which
+    appears almost instantly (unlike Tk, which has to start a whole new
+    interpreter-embedded GUI toolkit on every click and uses a slow,
+    dated dialog). Returns (handled, path): `handled` is False when no
+    usable native dialog exists so the caller can fall back to Tk, and
+    `path` is "" when the person cancelled."""
+    home = str(Path.home())
+    exts = " ".join(f"*{ext}" for ext in sorted(VIDEO_EXTENSIONS))
+
+    if shutil.which("zenity"):
+        title = {"file": "Select a video file", "output": "Select an output folder"}.get(
+            mode, "Select folder with videos")
+        cmd = ["zenity", "--file-selection", f"--title={title}", f"--filename={home}/"]
+        if mode == "file":
+            cmd += [f"--file-filter=Video files | {exts}", "--file-filter=All files | *"]
+        else:
+            cmd.append("--directory")
+    elif shutil.which("kdialog"):
+        if mode == "file":
+            cmd = ["kdialog", "--getopenfilename", home, f"{exts}|Video files"]
+        else:
+            cmd = ["kdialog", "--getexistingdirectory", home]
+    else:
+        return False, ""
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError:
+        return False, ""
+
+    if result.returncode == 0:
+        return True, result.stdout.strip()
+    if result.returncode == 1:  # cancelled
+        return True, ""
+    return False, ""  # e.g. no display for this tool: let Tk have a go
+
+
 @app.route("/api/browse", methods=["POST"])
 def browse():
     """Open a native picker on the machine running the server. `mode`
@@ -474,6 +514,13 @@ def browse():
     a directory picker; "file" opens a single-video file picker."""
     data = request.get_json(silent=True) or {}
     mode = data.get("mode", "folder")
+
+    if sys.platform.startswith("linux"):
+        handled, path = _native_linux_dialog(mode)
+        if handled:
+            if not path:
+                return jsonify({"success": False, "error": "Nothing selected"})
+            return jsonify({"success": True, "path": path})
 
     try:
         import tkinter as tk
